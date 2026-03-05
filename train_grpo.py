@@ -30,7 +30,14 @@ print(f"Using TRL library version: {trl.__version__}")
 
 # 禁用Hugging Face数据集缓存
 disable_caching()
-
+try:
+    import debugpy
+    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+    debugpy.listen(("localhost", 9503))
+    print("Waiting for debugger attach")
+    debugpy.wait_for_client()
+except Exception as e:
+    print(f"Debugpy failed to start: {e}")
 
 from transformers import TrainerCallback  # <--- 记得导入这个
 
@@ -192,7 +199,7 @@ def main():
     # --- CustomGRPOTrainer 实例化 ---
     trainer = Seq2SeqGRPOTrainer(
         token_level_rewards=True,
-        beam_search=True,
+        beam_search=False,
         model=model,
         args=grpo_config,
         reward_funcs=[reward_scorer.reward_function_rank_agnostic],

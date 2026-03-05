@@ -78,12 +78,48 @@ def build_partial_trie(sequences_chunk):
     trie = Trie(sequences_chunk)
     return trie
 
+from transformers import PreTrainedTokenizer, PreTrainedModel
+import torch
+
+def align_tokenizer_vocab_with_model(tokenizer: PreTrainedTokenizer, model: PreTrainedModel):
+    """
+    检查 Tokenizer 和模型的词表大小。如果 Tokenizer 较小，则自动添加占位符 Token 补齐。
+    防止在分布式训练或生成时出现 IndexError: piece id is out of range.
+    """
+    # 获取模型期望的词表大小（通常来自 config.json 里的 vocab_size）
+    target_vocab_size = model.config.vocab_size
+    # 获取 Tokenizer 当前认识的词表大小
+    current_tokenizer_size = len(tokenizer)
+    
+    if current_tokenizer_size < target_vocab_size:
+        num_to_add = target_vocab_size - current_tokenizer_size
+        print(f"📊 词表不匹配检测:")
+        print(f"   - 模型维度: {target_vocab_size}")
+        print(f"   - 当前词表: {current_tokenizer_size}")
+        print(f"正在手动添加 {num_to_add} 个占位符 Token 以对齐维度...")
+        
+        # 补齐差额。使用 <extra_id_X> 或自定义前缀。
+        # 注意：这些词只是为了让 Tokenizer 的索引映射表能够覆盖到 model.lm_head 的所有输出位。
+        new_tokens = [f"<extra_token_{i}>" for i in range(num_to_add)]
+        tokenizer.add_tokens(new_tokens)
+        
+        print(f"✅ 对齐成功。新 Tokenizer 大小: {len(tokenizer)}")
+    else:
+        print(f"✅ 词表已对齐 (Size: {current_tokenizer_size})，无需操作。")
+    
+    return tokenizer
 
 def load_generative_retrieval_model(args):
-    tokenizer = T5Tokenizer.from_pretrained(args.pretrain_model_path, use_fast=True)
+    # tokenizer = T5Tokenizer.from_pretrained(args.pretrain_model_path, use_fast=True)
+    tokenizer = T5Tokenizer.from_pretrained(args.checkpoint_path, use_fast=True)
     base_model = T5ForConditionalGeneration.from_pretrained(args.checkpoint_path,
-                                                            torch_dtype=torch.float32)
-
+                                                            torch_dtype=torch.float32,
+                                                            device_map=None,
+                                                            low_cpu_mem_usage=False)
+    print(f"Model Vocab Size: {base_model.config.vocab_size}")
+    print(f"Tokenizer Vocab Size: {len(tokenizer)}")
+    tokenizer = align_tokenizer_vocab_with_model(tokenizer, base_model)
+    print(f"Final Model Vocab Size: {base_model.config.vocab_size}")
     return base_model, tokenizer
 
 # def load_generative_retrieval_model(args):

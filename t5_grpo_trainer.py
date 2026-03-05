@@ -237,7 +237,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         rewards_per_func = self._calculate_rewards(
             inputs, prompts, completions, completion_ids_list
         )
-
+        print(f"Rewards per function: {rewards_per_func}")
         if self.token_level_rewards:
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=2) # (batch_size, max_len)
             # Compute advantages (group-normalized)
@@ -267,7 +267,10 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             )
             all_process_advantages = advantages.clone()
             advantages = advantages[process_slice]
-
+            #####新加的这个切片是为了适配 T5 的生成长度（24 或 28 或 31），而不是之前全局的 112。
+            # 必须把长度从全局的 112 切回本地的 24 (或 28, 31)
+            # advantages = advantages[:, :completion_ids.size(1)]
+            #############################################################################
             # Log metrics
             for i, reward_func_name in enumerate(self.reward_func_names):
                 self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
@@ -540,7 +543,6 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         Uses beam search instead of sampling to ensure unique outputs within each group.
         The incoming `prompts` are already duplicated by RepeatSampler:
             [p0, p0, ..., p0, p1, p1, ..., p1, ...]
-             \_num_gen_/       \_num_gen_/
         We deduplicate, run beam search with num_beams=num_generations, and each beam
         returns num_generations unique sequences per prompt.
         """
@@ -859,5 +861,67 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
+        print(f"{device}: rewards_per_func before gather: {rewards_per_func.shape}")
         rewards_per_func = gather(rewards_per_func)
+
+        print(f"没有发生死锁，运行到这里了, device:{device}")
+
+        # # 1. 计算本地长度
+        # local_max_len = rewards_per_func.shape[1]
+        
+        # # 2. 同步得到全局最大长度（解决 T5 长度不一的核心）
+        # local_max_len_tensor = torch.tensor(local_max_len, device=rewards_per_func.device)
+        # global_max_len = self.accelerator.reduce(local_max_len_tensor, reduction="max").item()
+        
+        # # 3. 补齐到全局长度，确保所有卡交给 gather 的形状完全一致
+        # if local_max_len < global_max_len:
+        #     pad_size = global_max_len - local_max_len
+        #     rewards_per_func = torch.nn.functional.pad(rewards_per_func, (0, 0, 0, pad_size))
+        
+        # # 4. 现在可以像 TRL 源码一样安全地 gather 了
+        # self.accelerator.wait_for_everyone()
+        # rewards_per_func = self.accelerator.gather(rewards_per_func)
+
+
         return rewards_per_func
+
+        
+    # def _calculate_rewards_token_level(self, inputs, prompts, completions, completion_ids_list):
+    #     device = self.accelerator.device
+        
+    #     # 1. 确定当前 batch 中 completion 的最大长度
+    #     max_len = max(len(ids) for ids in completion_ids_list) if completion_ids_list else 0
+        
+    #     # 2. 初始化奖励张量 (注意：这是本地进程的 size)
+    #     # shape: (batch_size_per_device, max_completion_len, num_reward_funcs)
+    #     rewards_per_func = torch.zeros(len(prompts), max_len, len(self.reward_funcs), device=device)
+
+    #     # 准备奖励函数的参数
+    #     keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+    #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+    #     reward_kwargs["trainer_state"] = self.state
+
+    #     # 3. 循环调用奖励函数
+    #     for i, (reward_func, _, reward_func_name) in enumerate(
+    #         zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+    #     ):
+    #         with profiling_context(self, reward_func_name):
+    #             # 调用你的奖励函数，它应该返回一个 List[List[float]]
+    #             # 外层长度 = len(prompts)，内层长度 = 各个 completion 的长度
+    #             output_reward_func = reward_func(
+    #                 prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+    #             )
+
+    #             # 4. 将奖励填入张量
+    #             for j, rewards in enumerate(output_reward_func):
+    #                 # 如果奖励是 None，转为 NaN
+    #                 rewards = [r if r is not None else torch.nan for r in rewards]
+    #                 # 填入对应的 token 位置
+    #                 rel_len = min(len(rewards), max_len)
+    #                 rewards_per_func[j, :rel_len, i] = torch.tensor(
+    #                     rewards[:rel_len], dtype=torch.float32, device=device
+    #                 )
+
+    #     # 5. 【关键】直接返回本地计算的结果，绝对不要调用 gather(rewards_per_func)
+    #     # TRL 基类会自动处理后续的跨进程均值/标准差计算
+    #     return rewards_per_func
