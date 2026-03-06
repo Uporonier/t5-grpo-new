@@ -1,3 +1,5 @@
+import random
+from typing import List
 
 import torch
 import math
@@ -17,6 +19,45 @@ class RewardScorer:
         # === 【修正】统一变量名为 epoch_xxx ===
         self.epoch_total_count = 0
         self.epoch_hit_count = 0
+    
+    def _get_local_ranks_for_sequence(self, qid: str, gen_ids: List[int]) -> List[int]:
+        """
+        核心封装：输入 Query ID 和生成序列，返回每个 Token 对应的排名列表。
+        """
+        query_prefix_map = self.rank_db.get(qid, {})
+        sample_local_ranks = []
+        current_prefix_ids = []
+        is_off_track = False
+
+        # 定义特殊 ID（建议在 __init__ 中保存，这里演示假设为 0 和 1）
+        pad_id = 0
+        eos_id = 1
+
+        for token in gen_ids:
+            # 1. 处理特殊 Token 或 已偏离路径的情况
+            if is_off_track or token == pad_id or token == eos_id:
+                # 如果已经偏离，后续全给惩罚分 101；如果是 EOS/PAD，给基础分 1
+                sample_local_ranks.append(101 if is_off_track else 1)
+                continue
+
+            # 2. 构造当前前缀的 Key
+            prefix_key = ",".join(map(str, current_prefix_ids))
+            if prefix_key != "":
+                prefix_key += ",1"  # 适配你数据库中带逗号的 key 格式
+
+            # 3. 查表获取下一跳的排名
+            next_token_ranks = query_prefix_map.get(prefix_key, {})
+            
+            if token in next_token_ranks:
+                rank = next_token_ranks[token]
+                sample_local_ranks.append(rank)
+                current_prefix_ids.append(token)
+            else:
+                # 发现不在 Trie 树路径上，标记为“偏离”
+                sample_local_ranks.append(101)
+                is_off_track = True
+
+        return sample_local_ranks
 
 
     def reward_function(self, prompts, completions, completion_ids, **kwargs):
@@ -120,10 +161,7 @@ class RewardScorer:
                         seq_rewards[t] = step_r
 
                 batch_token_rewards.append(seq_rewards)
-            # 返回 List[List[float]]
-            # print("="*60)
-            # print({"epoch_total_count": self.epoch_total_count, "epoch_hit_count": self.epoch_hit_count, "epoch_hit_rate": self.epoch_hit_count/self.epoch_total_count if self.epoch_total_count>0 else 0.0})
-            # print("="*60)
+
             return batch_token_rewards
 
 
@@ -266,6 +304,77 @@ class RewardScorer:
 
     # 3. 消融实验 C：w/o Dense Guidance (Rank-agnostic)
     # 逻辑：保留 Stepwise 奖励，但不使用 Rank 大小来区分好坏。只要路径有效（即在 Trie 内，Rank < 100），就给一个固定的常数奖励（例如 0.2）。这验证了“Dense Teacher”提供的排名质量的重要性。
+    # def reward_function_rank_agnostic(self, prompts, completions, completion_ids, **kwargs):
+    #     """
+    #     [消融实验 3] w/o Dense Guidance (Rank-agnostic)
+    #     - 局部奖励 (Stepwise): 只要路径有效就给固定分 (忽略具体 rank)
+    #     - 全局奖励分配: 正常计算分支权重
+    #     """
+    #     batch_token_rewards = []
+    #     ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+    #     local_ranks_batch = kwargs.get("local_ranks", [[1]*len(c) for c in completion_ids])
+    #     rank_db = self.rank_db 
+    #     qids = kwargs.get("qid", [])
+
+    #     for i in range(len(completion_ids)):
+    #         gen_ids = completion_ids[i]
+    #         local_ranks = local_ranks_batch[i]
+    #         relevant_set = ground_truth_sets[i]
+    #         qid = str(qids[i])
+    #         query_prefix_map = rank_db.get(qid, {})
+
+    #         seq_rewards = [0.0] * len(gen_ids)
+    #         start_idx = 0
+    #         end_idx = len(gen_ids)
+    #         content_ids = gen_ids[start_idx:end_idx]
+
+    #         # --- 1. 计算全局奖励 ---
+    #         key_str = ",".join(map(str, content_ids))
+    #         decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+    #         r_global = 0.0
+    #         if decoded_docid and decoded_docid in relevant_set:
+    #             r_global += 5.0
+
+    #         # --- 2. 计算分支权重 (正常) ---
+    #         decision_weights = []
+    #         if r_global > 0:
+    #             current_prefix_ids = []
+    #             for t in range(start_idx, end_idx):
+    #                 prefix_key = ",".join(map(str, current_prefix_ids))
+    #                 if prefix_key != "": prefix_key += ",1" 
+    #                 candidates = query_prefix_map.get(prefix_key, {})
+    #                 num_c = len(candidates)
+    #                 weight = math.log1p(num_c)
+    #                 decision_weights.append(weight)
+    #                 current_prefix_ids.append(gen_ids[t])
+    #             total_weight = sum(decision_weights) if sum(decision_weights) > 0 else 1.0
+
+    #         # --- 3. 计算每一步奖励 ---
+    #         current_prefix_ids = []
+    #         for t in range(start_idx, end_idx):
+    #             rank = local_ranks[t]
+                
+    #             # Stepwise: 忽略具体 rank 大小
+    #             step_r = 0.0
+    #             if rank >= 100:
+    #                 step_r = -0.1 # 路径无效，依然惩罚
+    #             else:
+    #                 # === [修改点] 只要有效，给固定分，不再用 1/log(rank) ===
+    #                 step_r = 0.2  # 固定奖励常数
+
+    #             # Global: 正常分配
+    #             if r_global > 0:
+    #                 dist_weight = decision_weights[t] / total_weight if len(decision_weights) > t else 0
+    #                 seq_rewards[t] = step_r + r_global * dist_weight
+    #             else:
+    #                 seq_rewards[t] = step_r
+                
+    #             current_prefix_ids.append(gen_ids[t])
+
+    #         batch_token_rewards.append(seq_rewards)
+        
+    #     return batch_token_rewards
+
     def reward_function_rank_agnostic(self, prompts, completions, completion_ids, **kwargs):
         """
         [消融实验 3] w/o Dense Guidance (Rank-agnostic)
@@ -274,64 +383,57 @@ class RewardScorer:
         """
         batch_token_rewards = []
         ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
-        local_ranks_batch = kwargs.get("local_ranks", [[1]*len(c) for c in completion_ids])
-        rank_db = self.rank_db 
         qids = kwargs.get("qid", [])
 
         for i in range(len(completion_ids)):
             gen_ids = completion_ids[i]
-            local_ranks = local_ranks_batch[i]
-            relevant_set = ground_truth_sets[i]
             qid = str(qids[i])
-            query_prefix_map = rank_db.get(qid, {})
+            relevant_set = ground_truth_sets[i]
+            query_prefix_map = self.rank_db.get(qid, {})
+
+            # --- [关键修改：模块化调用] ---
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            # ---------------------------
 
             seq_rewards = [0.0] * len(gen_ids)
-            start_idx = 0
-            end_idx = len(gen_ids)
-            content_ids = gen_ids[start_idx:end_idx]
-
+            
             # --- 1. 计算全局奖励 ---
-            key_str = ",".join(map(str, content_ids))
+            key_str = ",".join(map(str, gen_ids))
             decoded_docid = self.encoded_key_to_original_docid.get(key_str)
-            r_global = 0.0
-            if decoded_docid and decoded_docid in relevant_set:
-                r_global += 5.0
-
-            # --- 2. 计算分支权重 (正常) ---
+            r_global = 5.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+            # --- 2. 计算决策权重 (Branching Weight) ---
+            # 依然需要遍历一次来获取拓扑权重
             decision_weights = []
-            if r_global > 0:
-                current_prefix_ids = []
-                for t in range(start_idx, end_idx):
-                    prefix_key = ",".join(map(str, current_prefix_ids))
-                    if prefix_key != "": prefix_key += ",1" 
-                    candidates = query_prefix_map.get(prefix_key, {})
-                    num_c = len(candidates)
-                    weight = math.log1p(num_c)
-                    decision_weights.append(weight)
-                    current_prefix_ids.append(gen_ids[t])
-                total_weight = sum(decision_weights) if sum(decision_weights) > 0 else 1.0
+            curr_prefix = []
+            for t in range(len(gen_ids)):
+                p_key = ",".join(map(str, curr_prefix))
+                
+                if p_key != "": p_key += ",1" 
+                num_c = len(query_prefix_map.get(p_key, {}))
+                decision_weights.append(math.log1p(num_c))
+                curr_prefix.append(gen_ids[t].item() if hasattr(gen_ids[t], 'item') else gen_ids[t])
+            
+            total_weight = sum(decision_weights) if sum(decision_weights) > 0 else 1.0
 
-            # --- 3. 计算每一步奖励 ---
-            current_prefix_ids = []
-            for t in range(start_idx, end_idx):
+            # --- 3. 计算最终 Token Reward ---
+            for t in range(len(gen_ids)):
                 rank = local_ranks[t]
                 
-                # Stepwise: 忽略具体 rank 大小
-                step_r = 0.0
-                if rank >= 100:
-                    step_r = -0.1 # 路径无效，依然惩罚
-                else:
-                    # === [修改点] 只要有效，给固定分，不再用 1/log(rank) ===
-                    step_r = 0.2  # 固定奖励常数
-
-                # Global: 正常分配
+                # Stepwise: Rank-agnostic 逻辑，有效就给 0.2
+                step_r = 0.2 if rank < 100 else -0.1
+                
+                # Global 权重分配
+                dist_weight = decision_weights[t] / total_weight
+                
                 if r_global > 0:
-                    dist_weight = decision_weights[t] / total_weight if len(decision_weights) > t else 0
                     seq_rewards[t] = step_r + r_global * dist_weight
                 else:
                     seq_rewards[t] = step_r
                 
-                current_prefix_ids.append(gen_ids[t])
+                # seq_rewards[t] += r_real_doc   # 额外加上解码到真实文档的奖励  
+                ## DEBUG
+                # noise = random.uniform(-2, 2)
+                # seq_rewards[t] += noise 
 
             batch_token_rewards.append(seq_rewards)
         
@@ -466,7 +568,109 @@ class RewardScorer:
         return batch_token_rewards
 
 
+    def reward_function_try_10(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [消融实验 3] w/o Dense Guidance (Rank-agnostic)
+        - 局部奖励 (Stepwise): 只要路径有效就给固定分 (忽略具体 rank)
+        - 全局奖励分配: 正常计算分支权重
+        """
+        batch_token_rewards = []
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        qids = kwargs.get("qid", [])
 
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            query_prefix_map = self.rank_db.get(qid, {})
+
+            # --- [关键修改：模块化调用] ---
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            # ---------------------------
+
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            # --- 1. 计算全局奖励 ---
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            r_global = 20.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+
+            # --- 3. 计算最终 Token Reward ---
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # Stepwise: Rank-agnostic 逻辑，有效就给 0.2
+                step_r = 10/math.log1p(rank) if rank <= 100 else -1
+                
+                # Global 权重分配
+                # dist_weight = decision_weights[t] / total_weight
+                
+                if r_global > 0:
+                    seq_rewards[t] = step_r + r_global 
+                else:
+                    seq_rewards[t] = step_r
+                
+                # seq_rewards[t] += r_real_doc   # 额外加上解码到真实文档的奖励  
+                ## DEBUG
+                # noise = random.uniform(-2, 2)
+                # seq_rewards[t] += noise 
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
+
+
+
+    def reward_function_try_0(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [消融实验 3] w/o Dense Guidance (Rank-agnostic)
+        - 局部奖励 (Stepwise): 只要路径有效就给固定分 (忽略具体 rank)
+        - 全局奖励分配: 正常计算分支权重
+        """
+        batch_token_rewards = []
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        qids = kwargs.get("qid", [])
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            query_prefix_map = self.rank_db.get(qid, {})
+
+            # --- [关键修改：模块化调用] ---
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            # ---------------------------
+
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            # --- 1. 计算全局奖励 ---
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            r_global = 1.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+
+            # --- 3. 计算最终 Token Reward ---
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # Stepwise: Rank-agnostic 逻辑，有效就给 0.2
+                step_r = 0.2 if rank <= 100 else -0.1
+                
+                # Global 权重分配
+                # dist_weight = decision_weights[t] / total_weight
+                
+                if r_global > 0:
+                    seq_rewards[t] = step_r + r_global 
+                else:
+                    seq_rewards[t] = step_r
+                
+                # seq_rewards[t] += r_real_doc   # 额外加上解码到真实文档的奖励  
+                ## DEBUG
+                # noise = random.uniform(-2, 2)
+                # seq_rewards[t] += noise 
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
 
 
 

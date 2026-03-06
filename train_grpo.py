@@ -26,18 +26,20 @@ import shelve
 os.environ["WANDB_MODE"] = "disabled"
 os.environ["SWANLAB_DISABLED"] = "false"
 
+
 print(f"Using TRL library version: {trl.__version__}")
 
 # 禁用Hugging Face数据集缓存
 disable_caching()
-try:
-    import debugpy
-    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-    debugpy.listen(("localhost", 9503))
-    print("Waiting for debugger attach")
-    debugpy.wait_for_client()
-except Exception as e:
-    print(f"Debugpy failed to start: {e}")
+
+# try:
+#     import debugpy
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9503))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     print(f"Debugpy failed to start: {e}")
 
 from transformers import TrainerCallback  # <--- 记得导入这个
 
@@ -95,20 +97,11 @@ def main():
     print("Loading models...")
     model, tokenizer = load_generative_retrieval_model(args)
 
-    # model.gradient_checkpointing = False
 
-    # --- 加载 Reference Model ---
-    # print("Loading reference model...")
-    # ref_model, _ = load_generative_retrieval_model(args)
-    # ref_model.eval()
-    # ref_model.gradient_checkpointing = False
     
      # --- 数据加载 ---
     encoded_key_to_original, original_to_encoded_list, all_encoded = load_encoded_docids_and_create_map(args.encoded_docid_path)
 
-    # --- 奖励函数 ---
-    # reward_scorer = RewardScorer(encoded_key_to_original,original_to_encoded_list, 
-    #     gamma=0.9)
     rank_db = shelve.open(RANK_MAP_PATH, flag='r')
     # --- 奖励函数 ---
     reward_scorer = RewardScorer(encoded_key_to_original, original_to_encoded_list, 
@@ -149,10 +142,15 @@ def main():
     print(f"Train dataset size: {len(train_dataset)}, Dev dataset size: {len(dev_dataset)}")
 
     myevaluator = evaluator()
-
+    model_init_kwargs = {
+            "device_map": None,
+            "torch_dtype": torch.float32,
+            "low_cpu_mem_usage": False,
+        }
     # --- GRPO 配置 ---
     grpo_config = GRPOConfig(
-        num_iterations= 2,
+        model_init_kwargs=model_init_kwargs,
+        num_iterations= 1,
         half_precision_backend=False,
         ddp_find_unused_parameters=False,
         # gradient_checkpointing=False,
@@ -166,7 +164,7 @@ def main():
         learning_rate=args.learning_rate,
         max_grad_norm=1.0,
         lr_scheduler_type="cosine",
-        warmup_steps=800,
+        warmup_steps=100,
         # dataloader_num_workers=32,
         # dataloader_prefetch_factor=16,
         
@@ -198,8 +196,9 @@ def main():
     
     # --- CustomGRPOTrainer 实例化 ---
     trainer = Seq2SeqGRPOTrainer(
+        # prefix_allowed_tokens_fn = prefix_allowed_tokens_fn,
         token_level_rewards=True,
-        beam_search=False,
+        beam_search=True,
         model=model,
         args=grpo_config,
         reward_funcs=[reward_scorer.reward_function_rank_agnostic],
@@ -229,6 +228,7 @@ def main():
 
     # --- 训练和保存 ---
     # print(model.config)
+    # trainer.evaluate()
     trainer.train()
 
     eval_output = trainer.evaluate()

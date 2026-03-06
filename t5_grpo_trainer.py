@@ -16,7 +16,9 @@ from trl.models.utils import disable_gradient_checkpointing, unwrap_model_for_ge
 from utils import docid2string_msmarco, safe_lookup
 
 logger = logging.get_logger(__name__)
-
+# 定义在文件顶层，这样 pickle 就能通过模块路径找到它
+def simple_collate_fn(batch):
+    return batch
 
 class Seq2SeqGRPOTrainer(GRPOTrainer):
     """
@@ -237,9 +239,10 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         rewards_per_func = self._calculate_rewards(
             inputs, prompts, completions, completion_ids_list
         )
-        print(f"Rewards per function: {rewards_per_func}")
+        # print(f"Rewards per function: {rewards_per_func}")
         if self.token_level_rewards:
-            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=2) # (batch_size, max_len)
+            # token-level reward: (batch_size, num_reward_funcs, max_len)
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=1) # (batch_size, max_len)
             # Compute advantages (group-normalized)
             num_generations = (
                 self.num_generations if mode == "train" else self.num_generations_eval
@@ -258,7 +261,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
 
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
             if self.scale_rewards != "none":
-                advantages = advantages / (std_rewards + 1e-4)
+                advantages = advantages / (std_rewards + 1e-4)   # reward_std很小  e 从1e-4改成0.1
 
             # Slice to local process
             process_slice = slice(
@@ -269,7 +272,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             advantages = advantages[process_slice]
             #####新加的这个切片是为了适配 T5 的生成长度（24 或 28 或 31），而不是之前全局的 112。
             # 必须把长度从全局的 112 切回本地的 24 (或 28, 31)
-            # advantages = advantages[:, :completion_ids.size(1)]
+            advantages = advantages[:, :completion_ids.size(1)]
             #############################################################################
             # Log metrics
             for i, reward_func_name in enumerate(self.reward_func_names):
@@ -305,6 +308,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             return output
         
         else:
+            # sample-level reward
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1) # (batch_size, 1)
 
             # Compute advantages (group-normalized)
@@ -325,7 +329,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
 
             is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
             if self.scale_rewards != "none":
-                advantages = advantages / (std_rewards + 1e-4)
+                advantages = advantages / (std_rewards + 1e-4)  #1e-4
 
             # Slice to local process
             process_slice = slice(
@@ -474,66 +478,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         if self.beam_search and mode == "train":
             return self._generate_single_turn_beam_search(prompts)
         else:
-            return self._generate_single_turn_default(prompts)
-
-    def _generate_single_turn_default(self, prompts):
-        """
-        Override to handle T5's generate() which returns only decoder output tokens,
-        not the concatenated [prompt + completion] that decoder-only models return.
-        """
-        device = self.accelerator.device
-
-        # Tokenize prompts
-        generate_inputs = self.processing_class(
-            text=prompts, padding=True, padding_side="left", return_tensors="pt"
-        )
-        generate_inputs = super(GRPOTrainer, self)._prepare_inputs(generate_inputs)
-
-        with (
-            unwrap_model_for_generation(
-                self.model_wrapped,
-                self.accelerator,
-                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
-                generation_kwargs=self.generation_kwargs,
-            ) as unwrapped_model,
-            torch.no_grad(),
-        ):
-            # T5 generate() returns only decoder output (not prompt + completion)
-            # It prepends decoder_start_token_id — strip it
-            generated_ids = unwrapped_model.generate(
-                **generate_inputs,
-                generation_config=self.generation_config,
-            )
-
-        # T5 generate() prepends decoder_start_token_id; remove it
-        model_cfg = self.accelerator.unwrap_model(self.model).config
-        if generated_ids.size(1) > 0 and generated_ids[0, 0].item() == model_cfg.decoder_start_token_id:
-            completion_ids = generated_ids[:, 1:]
-        else:
-            completion_ids = generated_ids
-
-        # Extract prompt_ids
-        prompt_ids = generate_inputs["input_ids"]
-        prompt_mask = generate_inputs["attention_mask"]
-
-        # Mask everything after first EOS in completions
-        is_eos = completion_ids == self.eos_token_id
-        eos_idx = torch.full(
-            (is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device
-        )
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        seq_indices = torch.arange(is_eos.size(1), device=device).expand(
-            is_eos.size(0), -1
-        )
-        comp_mask = (seq_indices <= eos_idx.unsqueeze(1)).int()
-
-        # Convert to lists (matching parent's expected format)
-        prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
-        completion_ids = [c[m].tolist() for c, m in zip(completion_ids, comp_mask.bool())]
-        logprobs = None
-        extra_fields = {}
-
-        return prompt_ids, completion_ids, logprobs, extra_fields
+            return super()._generate_single_turn(prompts)
 
     def _generate_single_turn_beam_search(self, prompts):
         """
@@ -657,7 +602,8 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
                 batch_size=self.args.per_device_eval_batch_size,
                 shuffle=False, 
                 drop_last=False,
-                collate_fn=lambda x: x,
+                # collate_fn=lambda x: x,
+                collate_fn=simple_collate_fn,
                 num_workers=4
             )
             
@@ -821,8 +767,10 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
 
     def _calculate_rewards_token_level(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
-        max_len = max(len(ids) for ids in completion_ids_list)
-        rewards_per_func = torch.zeros(len(prompts), max_len, len(self.reward_funcs), device=device) # (batch_size, max_len, num_reward_funcs)
+        local_max_len = max(len(ids) for ids in completion_ids_list)
+        global_max_len = max(gather_object([local_max_len])) # get global max_len across all processes
+
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), global_max_len, device=device) # (batch_size, num_reward_funcs, max_len)
 
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
@@ -837,14 +785,12 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             with profiling_context(self, reward_func_name):
                 output_reward_func = reward_func(
                     prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
-                )
-                # Convert None values to NaN
-                # output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+                ) # (batch_size, current_sample_completion_len)
 
-                for rewards in output_reward_func:
+                for j, rewards in enumerate(output_reward_func):
                     # Convert None values to NaN
                     rewards = [r if r is not None else torch.nan for r in rewards]
-                    rewards_per_func[:, :len(rewards), i] = torch.tensor(rewards, dtype=torch.float32, device=device)
+                    rewards_per_func[j, i, :len(rewards)] = torch.tensor(rewards, dtype=torch.float32, device=device)
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -861,28 +807,8 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        print(f"{device}: rewards_per_func before gather: {rewards_per_func.shape}")
-        rewards_per_func = gather(rewards_per_func)
-
-        print(f"没有发生死锁，运行到这里了, device:{device}")
-
-        # # 1. 计算本地长度
-        # local_max_len = rewards_per_func.shape[1]
-        
-        # # 2. 同步得到全局最大长度（解决 T5 长度不一的核心）
-        # local_max_len_tensor = torch.tensor(local_max_len, device=rewards_per_func.device)
-        # global_max_len = self.accelerator.reduce(local_max_len_tensor, reduction="max").item()
-        
-        # # 3. 补齐到全局长度，确保所有卡交给 gather 的形状完全一致
-        # if local_max_len < global_max_len:
-        #     pad_size = global_max_len - local_max_len
-        #     rewards_per_func = torch.nn.functional.pad(rewards_per_func, (0, 0, 0, pad_size))
-        
-        # # 4. 现在可以像 TRL 源码一样安全地 gather 了
-        # self.accelerator.wait_for_everyone()
-        # rewards_per_func = self.accelerator.gather(rewards_per_func)
-
-
+        # print(f"{device}: rewards_per_func before gather: {rewards_per_func.shape}")
+        rewards_per_func = gather(rewards_per_func) # (total_batch_size, num_reward_funcs, max_len)
         return rewards_per_func
 
         

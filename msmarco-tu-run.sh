@@ -34,14 +34,14 @@ mkdir -p ${SAVE_PATH}
 # LAUNCH_CMD="python"
 
 
-LAUNCH_CMD="accelerate launch --num_processes=1 --main_process_port 29680"
+LAUNCH_CMD="accelerate launch --num_processes=8 --main_process_port 29680"
 
-export SWANLAB_PROJECT="GRPO-T5-NEW-DEBUG"
+export SWANLAB_PROJECT="GRPO-T5-NEW-DEBUG-reward_function_rank_agnostic"
 # CUDA_VISIBLE_DEVICES=0,1,2,3  ${LAUNCH_CMD}  ./train_grpo.py \
-CUDA_VISIBLE_DEVICES=0  ${LAUNCH_CMD}  /data2/chenran/workspace/ly/workspace/grpodebug/msmarco-tu-new-t5-grpo/train_grpo.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   ${LAUNCH_CMD}  /data2/chenran/workspace/ly/workspace/grpodebug/msmarco-tu-new-t5-grpo/train_grpo.py \
     --output_dir ${SAVE_PATH} \
-    --num_train_epochs 1 \
-    --per_device_train_batch_size 32 \
+    --num_train_epochs 2 \
+    --per_device_train_batch_size 256 \
     --per_device_eval_batch_size 32 \
     --pretrain_model_path ${PRETRAIN_MODEL_PATH} \
     --checkpoint_path ${CHECKPOINT_PATH} \
@@ -54,9 +54,9 @@ CUDA_VISIBLE_DEVICES=0  ${LAUNCH_CMD}  /data2/chenran/workspace/ly/workspace/grp
     --gradient_accumulation_steps 1 \
     --learning_rate 1e-4 \
     --num_generations 8 \
-    --beta 0.0 \
-    --save_steps 800 \
-    --eval_steps 800 \
-    # --report_to swanlab 2>&1 | tee ${SAVE_PATH}/train_$(date +%Y%m%d-%H%M%S).log
+    --beta 0  \
+    --save_steps 200 \
+    --eval_steps 200 \
+    --report_to swanlab 2>&1 | tee ${SAVE_PATH}/train_$(date +%Y%m%d-%H%M%S).log
     # --eval_on_start False \
 
