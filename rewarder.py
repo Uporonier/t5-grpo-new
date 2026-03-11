@@ -16,9 +16,6 @@ class RewardScorer:
         self.original_to_encoded_list = original_to_encoded_list
         self.gamma = gamma
         self.rank_db = rank_db
-        # === 【修正】统一变量名为 epoch_xxx ===
-        self.epoch_total_count = 0
-        self.epoch_hit_count = 0
     
     def _get_local_ranks_for_sequence(self, qid: str, gen_ids: List[int]) -> List[int]:
         """
@@ -104,11 +101,9 @@ class RewardScorer:
 
                 # --- 2. 计算全局奖励 (GT & Sim) ---
                 r_global = 0.0
-                self.epoch_total_count += 1
                 # Part A: GT
                 if decoded_docid and decoded_docid in relevant_set:
                     r_global += 2
-                    self.epoch_hit_count += 1  # 命中了就+1
 
                 # print(f"hit_count: {self.hit_count}, total_count: {self.total_count}, hit_rate: {self.hit_count/self.total_count:.4f}")
 
@@ -291,7 +286,7 @@ class RewardScorer:
 
                 if r_global > 0:
                     dist_weight = decision_weights[t] / total_weight if len(decision_weights) > t else 0
-                    seq_rewards[t] = step_r + r_global * dist_weight
+                    seq_rewards[t] = step_r + r_global / len(gen_ids)
                 else:
                     seq_rewards[t] = step_r # 即 0.0
 
@@ -400,7 +395,11 @@ class RewardScorer:
             # --- 1. 计算全局奖励 ---
             key_str = ",".join(map(str, gen_ids))
             decoded_docid = self.encoded_key_to_original_docid.get(key_str)
-            r_global = 5.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+            r_global = 2.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+
+
+            if decoded_docid is not None:    # 正确解码的奖励
+                r_global += 1
             # --- 2. 计算决策权重 (Branching Weight) ---
             # 依然需要遍历一次来获取拓扑权重
             decision_weights = []
@@ -422,18 +421,13 @@ class RewardScorer:
                 # Stepwise: Rank-agnostic 逻辑，有效就给 0.2
                 step_r = 0.2 if rank < 100 else -0.1
                 
-                # Global 权重分配
+                # Global 权重分配_compute_loss
                 dist_weight = decision_weights[t] / total_weight
                 
                 if r_global > 0:
                     seq_rewards[t] = step_r + r_global * dist_weight
                 else:
                     seq_rewards[t] = step_r
-                
-                # seq_rewards[t] += r_real_doc   # 额外加上解码到真实文档的奖励  
-                ## DEBUG
-                # noise = random.uniform(-2, 2)
-                # seq_rewards[t] += noise 
 
             batch_token_rewards.append(seq_rewards)
         
@@ -481,12 +475,10 @@ class RewardScorer:
             decoded_docid = self.encoded_key_to_original_docid.get(key_str)
 
             r_global = 0.0
-            self.epoch_total_count += 1
             
             # Case A: 命中 Ground Truth (最高奖励)
             if decoded_docid and decoded_docid in relevant_set:
                 r_global = 2.0
-                self.epoch_hit_count += 1
             
             # Case B: [New] 命中 Dense Top-10 (软标签)
             # 如果没命中 GT，但在这个 Query 的 Top 100 召回列表的前 10 名里，也给一点分
@@ -582,7 +574,6 @@ class RewardScorer:
             gen_ids = completion_ids[i]
             qid = str(qids[i])
             relevant_set = ground_truth_sets[i]
-            query_prefix_map = self.rank_db.get(qid, {})
 
             # --- [关键修改：模块化调用] ---
             local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
@@ -593,27 +584,23 @@ class RewardScorer:
             # --- 1. 计算全局奖励 ---
             key_str = ",".join(map(str, gen_ids))
             decoded_docid = self.encoded_key_to_original_docid.get(key_str)
-            r_global = 20.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+            r_global = 2.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+
+            if decoded_docid is not None:    # 正确解码的奖励
+                r_global += 1
 
             # --- 3. 计算最终 Token Reward ---
             for t in range(len(gen_ids)):
                 rank = local_ranks[t]
                 
                 # Stepwise: Rank-agnostic 逻辑，有效就给 0.2
-                step_r = 10/math.log1p(rank) if rank <= 100 else -1
+                step_r = 1/math.log1p(rank) if rank <= 100 else -1
                 
                 # Global 权重分配
-                # dist_weight = decision_weights[t] / total_weight
-                
                 if r_global > 0:
-                    seq_rewards[t] = step_r + r_global 
+                    seq_rewards[t] = step_r + r_global/len(gen_ids)
                 else:
                     seq_rewards[t] = step_r
-                
-                # seq_rewards[t] += r_real_doc   # 额外加上解码到真实文档的奖励  
-                ## DEBUG
-                # noise = random.uniform(-2, 2)
-                # seq_rewards[t] += noise 
 
             batch_token_rewards.append(seq_rewards)
         
@@ -671,9 +658,582 @@ class RewardScorer:
             batch_token_rewards.append(seq_rewards)
         
         return batch_token_rewards
+    
+    
+    def reward_function_v2(self, prompts, completions, completion_ids, **kwargs):
+        """
+        改进版奖励函数：
+        1. 消除长度陷阱：有效路径不给分，只在命中时给终点大分。
+        2. 强力约束：偏离 Trie 树给予较大负分。
+        3. 简洁奖励：微小的长度惩罚。
+        """
+        batch_token_rewards = []
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        qids = kwargs.get("qid", [])
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            
+            # 获取每个 token 对应的路径排名
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            seq_len = len(gen_ids)
+            seq_rewards = [0.0] * seq_len
+            
+            # --- 1. 计算全局命中奖励 (仅一次性判断) ---
+            # 只有完整生成的 docid 命中 GT 才给分
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            
+            # 基础全局分值设定为 10.0，不分摊
+            hit_reward = 10.0 if (decoded_docid and decoded_docid in relevant_set) else 0.0
+
+            # --- 2. Token-Level 逻辑分配 ---
+            is_off_track = False
+            for t in range(seq_len):
+                # A. 长度惩罚 (非常微小，促使模型尽早输出 EOS)
+                step_r = -0.01 
+                
+                rank = local_ranks[t]
+                
+                # B. 路径合法性判断
+                if rank >= 100:
+                    is_off_track = True
+                    step_r = -1.0  # 偏离路径给重罚
+                elif is_off_track:
+                    step_r = -1.0  # 一旦偏离，后面步步重罚
+                
+                # C. 命中奖励：只加在最后一个有效 Token 上 (脉冲式)
+                # 这样可以给模型一个强烈的信号：这一串路径最终导向了正确答案
+                if t == (seq_len - 1) and hit_reward > 0 and not is_off_track:
+                    seq_rewards[t] = step_r + hit_reward
+                else:
+                    seq_rewards[t] = step_r
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
 
 
 
 
+    def reward_function_generative_retrieval(self, prompts, completions, completion_ids, **kwargs):
+            """
+            专为生成式检索 (GR) 设计的 Token-level 奖励函数
+            结合了：密集前缀引导 + 节点难度加权 + 全局命中奖励 + 同组去重惩罚
+            """
+            batch_token_rewards = []
+            
+            # 获取每条 Query 对应的相关文档集合 (Ground Truth)
+            # 假设 relevant_docid_set 里面存的是 DocID 字符串 (如 "doc_1234")
+            ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+            qids = kwargs.get("qid", [])
+
+            # 遍历当前 Batch 中的每一条生成结果
+            for i in range(len(completion_ids)):
+                gen_ids = completion_ids[i]
+                qid = str(qids[i])
+                relevant_set = ground_truth_sets[i]
+                
+                # 初始化该条序列每个 Token 的奖励为 0
+                seq_rewards = [0.0] * len(gen_ids)
+                
+                # 将相关文档集合的字符串，提前转换为 Token ID 列表的形式，方便做前缀匹配
+                # 假设你有一个方法可以做到： "doc_123" -> [10, 25, 36, 99]
+                # 如果你有多个相关的 ground truth，就转化出多个 list
+                gt_token_lists = self._get_gt_token_lists_for_query(relevant_set)
+
+                # -----------------------------------------------------------------
+                # 状态追踪标志
+                # -----------------------------------------------------------------
+                is_on_right_track = True  # 标记当前是否还在正确的路径上
+                
+                # --- 开始逐个 Token 评估 ---
+                for t in range(len(gen_ids)):
+                    current_token = gen_ids[t].item() if hasattr(gen_ids[t], 'item') else gen_ids[t]
+                    current_prefix = gen_ids[:t+1]
+                    
+                    # 1. 前缀匹配检测 (判断当前走到 t 步时，是不是任何一个 GT 的前缀)
+                    match_any_gt = any(
+                        self._is_prefix(current_prefix, gt_seq) 
+                        for gt_seq in gt_token_lists
+                    )
+
+                    if match_any_gt and is_on_right_track:
+                        # ==========================================
+                        # 【场景 A】：走在正确的康庄大道上
+                        # ==========================================
+                        # 基础过路费奖励
+                        step_r = 0.5 
+                        
+                        # 难度加权：通过 Trie 树或 rank_db 查一下当前节点有几个合法子节点
+                        # 子节点越多，选对的含金量越高
+                        p_key = ",".join(map(str, gen_ids[:t]))
+                        if p_key != "": p_key += ",1" 
+                        num_children = len(self.rank_db.get(p_key, {})) # 或者查 docid_trie
+                        
+                        difficulty_weight = math.log1p(num_children) * 0.1 # 缩放因子 0.1 可调
+                        
+                        seq_rewards[t] = step_r + difficulty_weight
+
+                    else:
+                        # ==========================================
+                        # 【场景 B】：一旦走错一步，后续全错
+                        # ==========================================
+                        is_on_right_track = False # 永久打断
+                        
+                        # 走错了，给一个温和的惩罚。
+                        # 不要给太大的负数（比如 -10），否则模型会害怕探索，甚至学会提前截断
+                        seq_rewards[t] = -0.2
+
+                # ==========================================
+                # 【场景 C】：全局奖励 (到达终点且完全正确)
+                # ==========================================
+                # 将生成的完整序列转回字符串 DocID
+                key_str = ",".join(map(str, gen_ids))
+                decoded_docid = self.encoded_key_to_original_docid.get(key_str, None)
+                
+                # 只有最后一步才结算全局奖励 (加在序列末尾的 Token 上)
+                if decoded_docid and decoded_docid in relevant_set:
+                    # 命中目标！给予超级大奖
+                    seq_rewards[-1] += 15.0 
+                else:
+                    # 完整生成完发现不对，额外给个终点惩罚
+                    seq_rewards[-1] -= 2.0
+
+                batch_token_rewards.append(seq_rewards)
+                
+            return batch_token_rewards
+
+    # 辅助函数：判断 list1 是否是 list2 的前缀
+    def _is_prefix(self, prefix, full_seq):
+        if len(prefix) > len(full_seq):
+            return False
+        # 逐元素比较
+        for p, f in zip(prefix, full_seq):
+            if p != f:
+                return False
+        return True
+    
+    # 辅助函数：把 Ground truth 的 docid 字符串转成 Token ID 序列
+    def _get_gt_token_lists_for_query(self, relevant_set):
+        gt_lists = []
+        for docid_str in relevant_set:
+            # 根据你的字典转一下，例如 "MSMARCO_123" -> [45, 88, 99]
+            encoded_list = self.original_to_encoded_list.get(docid_str, [])
+            if encoded_list:
+                gt_lists.append(encoded_list)
+        return gt_lists
+
+
+
+    def reward_function_generative_retrieval_1(self, prompts, completions, completion_ids, **kwargs):
+        batch_token_rewards = []
+        
+        # 提取数据
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        top_100_docids_batch = kwargs.get("top_100_docids", [[]] * len(completion_ids)) 
+        qids = kwargs.get("qid", [])
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            top_100_list = top_100_docids_batch[i] if i < len(top_100_docids_batch) else []
+            query_prefix_map = self.rank_db.get(qid, {})
+            
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            # --- 1. 获取 Stepwise 排名 (Local Ranks) ---
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            
+            # --- 2. 评估全局终点 (Global Hit) ---
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            
+            r_global = 0.0
+            if decoded_docid:
+                if decoded_docid in relevant_set:
+                    # GT 命中超级大奖 (总资金池)
+                    r_global = 15.0
+                elif decoded_docid in top_100_list:
+                    # 软标签命中 (Dense Top 100)
+                    rank_idx = top_100_list.index(decoded_docid)
+                    # 排名越高分越多 (0.5 ~ 2.0)
+                    r_global = 2.0 * (1.0 - rank_idx / 100.0)
+
+
+            # --- 3. 计算拓扑分支难度 (Decision Weights) ---
+            # 这决定了全局奖金池怎么分给每一个 Token
+            decision_weights = []
+            curr_prefix = []
+            for t in range(len(gen_ids)):
+                p_key = ",".join(map(str, curr_prefix))
+                if p_key != "": 
+                    p_key += ",1" 
+                
+                num_c = len(query_prefix_map.get(p_key, {}))
+                decision_weights.append(math.log1p(num_c))
+                
+                token_val = gen_ids[t].item() if hasattr(gen_ids[t], 'item') else gen_ids[t]
+                curr_prefix.append(token_val)
+            
+            total_weight = sum(decision_weights)
+            # 防止全 0 除法
+            total_weight = total_weight if total_weight > 0 else 1.0
+
+            # --- 4. 融合与分配 (Stepwise + Distributed Global) ---
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # A. 基础过路费 (Stepwise 密集引导)
+                # 不用负数倒扣，用正数引导，防止 KL 散度爆炸和遗忘
+                if rank <= 100:
+                    step_r = 1.0 / math.log1p(rank)  # 排名越前，分数越高 (约 0.2 ~ 1.4)
+                else:
+                    step_r = -0.05  # 偏离路径给微弱惩罚
+                
+                # B. 分配全局奖金
+                if r_global > 0:
+                    dist_weight = decision_weights[t] / total_weight
+                    token_global_r = r_global * dist_weight
+                else:
+                    token_global_r = 0.0
+                
+                # C. 当前 Token 最终得分
+                seq_rewards[t] = step_r + token_global_r
+
+            batch_token_rewards.append(seq_rewards)
+            
+        return batch_token_rewards
+
+
+
+
+    def reward_function_noly_step(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [消融实验 3] w/o Dense Guidance (Rank-agnostic)
+        - 奖励是1/log(rank + 1)，rank <= 100 才有奖励，且不分配全局奖励
+        - rank > 100 奖励为0
+        """
+        batch_token_rewards = []
+        qids = kwargs.get("qid", [])
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]            
+                if rank <= 100:
+                    seq_rewards[t] = 1/math.log1p(rank)
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
+    
+
+    def reward_function_decay_state(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [消融实验 3 增强版] w/o Dense Guidance + Prefix Decay
+        - 基础奖励: 1/log1p(rank)
+        - 前缀折扣: 一旦出现高 Rank (> 20)，后续所有奖励进入衰减状态
+        """
+        batch_token_rewards = []
+        qids = kwargs.get("qid", [])
+        
+        # 调优参数：你可以根据实验调整
+        RANK_THRESHOLD = 20    # 触发衰减的排名阈值
+        DECAY_RATE = 0.9       # 每次触发后的折扣率（越小惩罚越狠）
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            
+            # 假设这是你获取每一步 rank 的方法
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            
+            seq_rewards = [0.0] * len(gen_ids)
+            current_multiplier = 1.0  # 初始倍率为 100%
+            
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # --- 前缀折扣逻辑 ---
+                # 如果当前 token 排名太靠后，降低后续所有 token 的“信用分”
+                if rank > RANK_THRESHOLD:
+                    current_multiplier *= DECAY_RATE
+                
+                # --- 基础奖励计算 ---
+                if rank <= 100:
+                    # 原始奖励 * 累积的折扣倍率
+                    base_reward = 1.0 / math.log1p(rank)
+                    seq_rewards[t] = base_reward * current_multiplier
+                else:
+                    seq_rewards[t] = 0.0
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
+
+    def reward_function_decay_state_all(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [终极融合版] 分支权重分配 + 前缀衰减 + 全局防作弊
+        解决问题：
+        1. 解决模型提前输出 EOS 骗分的作弊行为 (长度崩溃问题)。
+        2. 解决长序列前面 Token 拿不到全局反馈的问题 (TRL 无 Return-to-go 盲区)。
+        """
+        import math
+        batch_token_rewards = []
+        
+        qids = kwargs.get("qid", [])
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        
+        # --- 调优参数 ---
+        RANK_THRESHOLD = 20    # 触发衰减的排名阈值
+        DECAY_RATE = 0.9       # 偏离后的惩罚衰减率
+        GLOBAL_HIT_REWARD = 15.0     # 命中 Ground Truth 的超级大奖
+        GLOBAL_VALID_REWARD = 0.5    # 没命中，但生成了一个完整的合法 DocID (安慰奖)
+        GLOBAL_HACK_PENALTY = -2.0   # 作弊惩罚：提前截断、乱码、不完整的 DocID
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            query_prefix_map = self.rank_db.get(qid, {})
+            
+            # 获取每一步 rank
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            # ==========================================
+            # 1. 终局裁判 (Global Check)
+            # ==========================================
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            
+            r_global = 0.0
+            if decoded_docid:
+                # 能够成功解码，说明模型跑完了完整的 Trie 树路径，没有作弊截断
+                if decoded_docid in relevant_set:
+                    r_global = GLOBAL_HIT_REWARD  # 彻底找对！
+                else:
+                    r_global = GLOBAL_VALID_REWARD # 虽然找错了，但格式和生成过程很乖，给小奖
+            else:
+                # 致命作弊：根本没生成合法的 DocID 就提前结束了（引发你图表中长度跌到 2 的元凶）
+                r_global = GLOBAL_HACK_PENALTY
+                
+
+            # ==========================================
+            # 2. 拓扑难度计算 (用于分配正向全局奖励)
+            # ==========================================
+            decision_weights = []
+            curr_prefix = []
+            for t in range(len(gen_ids)):
+                p_key = ",".join(map(str, curr_prefix))
+                if p_key != "": 
+                    p_key += ",1" 
+                
+                num_c = len(query_prefix_map.get(p_key, {}))
+                decision_weights.append(math.log1p(num_c))
+                
+                token_val = gen_ids[t].item() if hasattr(gen_ids[t], 'item') else gen_ids[t]
+                curr_prefix.append(token_val)
+                
+            total_weight = sum(decision_weights) if sum(decision_weights) > 0 else 1.0
+
+            # ==========================================
+            # 3. 逐 Token 结算 (Stepwise + Decay + 分配)
+            # ==========================================
+            current_multiplier = 1.0  # 初始信用倍率
+            
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # --- A. 前缀折扣逻辑 ---
+                if rank > RANK_THRESHOLD:
+                    current_multiplier *= DECAY_RATE
+                
+                # --- B. 局部引导分数 ---
+                if rank <= 100:
+                    step_r = (1.0 / math.log1p(rank)) * current_multiplier
+                else:
+                    step_r = -0.1 # 绝对偏离的微弱惩罚
+                
+                # --- C. 全局大奖分配 ---
+                # 如果是正向大奖，科学地切碎分给每一个关键 Token
+                if r_global > 0:
+                    dist_weight = decision_weights[t] / total_weight
+                    token_global_r = r_global * dist_weight
+                else:
+                    token_global_r = 0.0
+                    
+                # 汇总当前 Token 分数
+                seq_rewards[t] = step_r + token_global_r
+                
+                # --- D. 绝杀作弊者 ---
+                # 如果是负向惩罚（作弊截断），直接狠狠砸在最后一个 Token 上！
+                # 这会立刻让模型意识到：提前结束是死路一条！
+                if t == len(gen_ids) - 1 and r_global < 0:
+                    seq_rewards[t] += r_global
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
+    def reward_function_decay_state_all_without_GLOBAL_VALID_REWARD(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [终极融合版] 分支权重分配 + 前缀衰减 + 全局防作弊
+        解决问题：
+        1. 解决模型提前输出 EOS 骗分的作弊行为 (长度崩溃问题)。
+        2. 解决长序列前面 Token 拿不到全局反馈的问题 (TRL 无 Return-to-go 盲区)。
+        """
+        import math
+        batch_token_rewards = []
+        
+        qids = kwargs.get("qid", [])
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        
+        # --- 调优参数 ---
+        RANK_THRESHOLD = 20    # 触发衰减的排名阈值
+        DECAY_RATE = 0.9       # 偏离后的惩罚衰减率
+        GLOBAL_HIT_REWARD = 15.0     # 命中 Ground Truth 的超级大奖
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            query_prefix_map = self.rank_db.get(qid, {})
+            
+            # 获取每一步 rank
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            seq_rewards = [0.0] * len(gen_ids)
+            
+            # ==========================================
+            # 1. 终局裁判 (Global Check)
+            # ==========================================
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            
+            r_global = 0.0
+            if decoded_docid:
+                # 能够成功解码，说明模型跑完了完整的 Trie 树路径，没有作弊截断
+                if decoded_docid in relevant_set:
+                    r_global = GLOBAL_HIT_REWARD  # 彻底找对！
+
+
+            # ==========================================
+            # 2. 拓扑难度计算 (用于分配正向全局奖励)
+            # ==========================================
+            decision_weights = []
+            curr_prefix = []
+            for t in range(len(gen_ids)):
+                p_key = ",".join(map(str, curr_prefix))
+                if p_key != "": 
+                    p_key += ",1" 
+                
+                num_c = len(query_prefix_map.get(p_key, {}))
+                decision_weights.append(math.log1p(num_c))
+                
+                token_val = gen_ids[t].item() if hasattr(gen_ids[t], 'item') else gen_ids[t]
+                curr_prefix.append(token_val)
+                
+            total_weight = sum(decision_weights) if sum(decision_weights) > 0 else 1.0
+
+            # ==========================================
+            # 3. 逐 Token 结算 (Stepwise + Decay + 分配)
+            # ==========================================
+            current_multiplier = 1.0  # 初始信用倍率
+            
+            for t in range(len(gen_ids)):
+                rank = local_ranks[t]
+                
+                # --- A. 前缀折扣逻辑 ---
+                if rank > RANK_THRESHOLD:
+                    current_multiplier *= DECAY_RATE
+                
+                # --- B. 局部引导分数 ---
+                if rank <= 100:
+                    step_r = (1.0 / math.log1p(rank)) * current_multiplier
+                else:
+                    step_r = -0.1 # 绝对偏离的微弱惩罚
+                
+                # --- C. 全局大奖分配 ---
+                # 如果是正向大奖，科学地切碎分给每一个关键 Token
+                if r_global > 0:
+                    dist_weight = decision_weights[t] / total_weight
+                    token_global_r = r_global * dist_weight
+                else:
+                    token_global_r = 0.0
+                    
+                # 汇总当前 Token 分数
+                seq_rewards[t] = step_r + token_global_r
+                
+
+
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
+    
+
+
+    def reward_function_pulsed(self, prompts, completions, completion_ids, **kwargs):
+        """
+        [优化版] 脉冲式奖励函数
+        1. 消除长度陷阱：路径中间不给正分。
+        2. 严格路径约束：一旦 Rank > 20 立即给惩罚并截断后续奖励。
+        3. 全局命中大奖：只有在生成完整且合法的 DocID 时才发放。
+        """
+        batch_token_rewards = []
+        ground_truth_sets = kwargs.get("relevant_docid_set", [set()] * len(completion_ids))
+        qids = kwargs.get("qid", [])
+
+        for i in range(len(completion_ids)):
+            gen_ids = completion_ids[i]
+            qid = str(qids[i])
+            relevant_set = ground_truth_sets[i]
+            
+            # 获取每一步的局部排名
+            local_ranks = self._get_local_ranks_for_sequence(qid, gen_ids)
+            seq_len = len(gen_ids)
+            seq_rewards = [0.0] * seq_len
+            
+            # --- A. 终局判定 (Global Check) ---
+            key_str = ",".join(map(str, gen_ids))
+            decoded_docid = self.encoded_key_to_original_docid.get(key_str)
+            
+            # 判定是否彻底命中 GT
+            is_hit = (decoded_docid and decoded_docid in relevant_set)
+            
+            # --- B. 逐 Token 奖励分配 ---
+            off_track_t = -1  # 记录第一次偏离的位置
+            for t in range(seq_len):
+                rank = local_ranks[t]
+                
+                # 1. 路径惩罚：一旦排名靠后（比如不在前20），给予阶梯式扣分
+                if rank > 20:
+                    if off_track_t == -1: off_track_t = t
+                    seq_rewards[t] = -0.5  # 偏离惩罚
+                elif rank > 1:
+                    seq_rewards[t] = -0.05 # 走在边缘的微弱惩罚，促使模型追求 Rank 1
+                else:
+                    seq_rewards[t] = 0.0   # 走在 Rank 1 路径上不加分也不扣分
+                
+                # 2. 长度陷阱防御：如果序列太短且没解码出东西，给一个结尾重罚
+                if t == seq_len - 1 and not decoded_docid:
+                    seq_rewards[t] -= 2.0
+
+            # --- C. 脉冲奖励 (The Impulse) ---
+            # 只有在没有偏离路径且最终命中的情况下，在最后一个 Token 加上巨额奖励
+            if is_hit and off_track_t == -1:
+                # 这里的 20.0 是为了盖过所有的微弱惩罚，让命中成为唯一目标
+                seq_rewards[-1] += 20.0 
+            
+            batch_token_rewards.append(seq_rewards)
+        
+        return batch_token_rewards
 
 

@@ -292,3 +292,20 @@ def safe_lookup(
         return _to_list(table[alt_key])
     
     return [] # 没找到返回空列表
+
+def disable_dropout_in_model(m: torch.nn.Module):
+    print("Force disabling all dropout layers and attributes in the instantiated models...")
+    for module in m.modules():
+        # 1. 抓取 nn.Dropout 层
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+        
+        # 2. 抓取 T5Attention 等结构内部的 float 属性
+        if hasattr(module, "dropout") and isinstance(module.dropout, float):
+            module.dropout = 0.0
+        if hasattr(module, "dropout_rate") and isinstance(module.dropout_rate, float):
+            module.dropout_rate = 0.0
+        if hasattr(module, "attention_dropout") and isinstance(module.attention_dropout, float):
+            module.attention_dropout = 0.0
+
+    m.config.dropout_rate = 0.0

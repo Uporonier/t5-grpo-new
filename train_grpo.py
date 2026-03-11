@@ -19,6 +19,7 @@ from utils import (
     create_dataset_with_ranking_list,
     build_partial_trie,
     load_qrels,
+    disable_dropout_in_model
 )
 
 from evaluate import evaluator
@@ -41,17 +42,6 @@ disable_caching()
 # except Exception as e:
 #     print(f"Debugpy failed to start: {e}")
 
-from transformers import TrainerCallback  # <--- 记得导入这个
-
-class GlobalRealTimeCallback(TrainerCallback):
-    def __init__(self, reward_scorer, print_every_steps=10):
-        """
-        Args:
-            reward_scorer: 你的计分器实例
-            print_every_steps: 每多少步汇总打印一次 (建议设为 10 或 50)
-        """
-        self.reward_scorer = reward_scorer
-        self.print_every_steps = print_every_steps
 
 
 def main():
@@ -96,7 +86,7 @@ def main():
     # --- 模型加载 ---
     print("Loading models...")
     model, tokenizer = load_generative_retrieval_model(args)
-
+    ref_model, _ = load_generative_retrieval_model(args) # 同样的函数，同样的 checkpoint
 
     
      # --- 数据加载 ---
@@ -149,8 +139,9 @@ def main():
         }
     # --- GRPO 配置 ---
     grpo_config = GRPOConfig(
+        disable_dropout=True,  # 强制禁用所有 dropout
         model_init_kwargs=model_init_kwargs,
-        num_iterations= 1,
+        num_iterations= 2,
         half_precision_backend=False,
         ddp_find_unused_parameters=False,
         # gradient_checkpointing=False,
@@ -164,7 +155,7 @@ def main():
         learning_rate=args.learning_rate,
         max_grad_norm=1.0,
         lr_scheduler_type="cosine",
-        warmup_steps=100,
+        warmup_steps=500,
         # dataloader_num_workers=32,
         # dataloader_prefetch_factor=16,
         
@@ -194,14 +185,20 @@ def main():
         seed=42,
     )
     
+                
+    disable_dropout_in_model(model)
+    if ref_model is not None:
+        disable_dropout_in_model(ref_model)
+
     # --- CustomGRPOTrainer 实例化 ---
     trainer = Seq2SeqGRPOTrainer(
         # prefix_allowed_tokens_fn = prefix_allowed_tokens_fn,
+        # ref_model=ref_model,
         token_level_rewards=True,
         beam_search=True,
         model=model,
         args=grpo_config,
-        reward_funcs=[reward_scorer.reward_function_rank_agnostic],
+        reward_funcs=[reward_scorer.reward_function_pulsed],
         train_dataset=train_dataset, 
         eval_dataset=dev_dataset,
         processing_class=tokenizer,
@@ -216,31 +213,10 @@ def main():
             "max_length": 100,
         },
     )
-
-    # trainer.valid_docid_check = prefix_allowed_tokens_fn
-
-    # 假设你的 args.logging_steps 是 10 或 100
-    logging_freq = args.logging_steps if args.logging_steps > 0 else 10
-
-    # 注册准实时监控 Callback
-    realtime_callback = GlobalRealTimeCallback(reward_scorer, print_every_steps=logging_freq)
-    trainer.add_callback(realtime_callback)
-
-    # --- 训练和保存 ---
-    # print(model.config)
-    # trainer.evaluate()
+    trainer.evaluate()
     trainer.train()
-
     eval_output = trainer.evaluate()
     print(eval_output)
-
-    # final_save_path = os.path.join(args.output_dir, "grpo_model_final.pkl")
-
-    # unwrapped_model = trainer.accelerator.unwrap_model(trainer.model)
-    # torch.save(unwrapped_model.state_dict(), final_save_path)
-    # print(f"Final model saved to {final_save_path}")
-
-    # trainer.end_of_training()
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,7 @@ from trl.models.utils import disable_gradient_checkpointing, unwrap_model_for_ge
 from utils import docid2string_msmarco, safe_lookup
 
 logger = logging.get_logger(__name__)
+
 # 定义在文件顶层，这样 pickle 就能通过模块路径找到它
 def simple_collate_fn(batch):
     return batch
@@ -44,6 +45,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         self.evaluator = evaluator
         self.encoded_key_to_original = encoded_key_to_original
         self.eval_generation_kwargs = eval_generation_kwargs or {}
+
 
     def _get_per_token_logps_and_entropies(
         self, model, input_ids, attention_mask, logits_to_keep,
@@ -132,21 +134,872 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         decoder_input_ids = torch.cat([start_tokens, completion_ids[:, :-1]], dim=1)
         return decoder_input_ids
 
+# ##原本的
+    # def _generate_and_score_completions(self, inputs):
+    #     """
+    #     Override to handle encoder-decoder generation and scoring.
+
+    #     Key differences from the parent:
+    #     - T5 generate() returns only decoder output, not [prompt + completion]
+    #     - We store prompt_ids and completion_ids separately (not concatenated)
+    #     - Log-prob computation passes them to encoder and decoder respectively
+    #     """
+    #     device = self.accelerator.device
+    #     mode = "train" if self.model.training else "eval"
+
+    #     prompts = [x["prompt"] for x in inputs]
+
+    #     # Generate completions
+    #     (
+    #         prompt_ids_list,
+    #         completion_ids_list,
+    #         tool_mask_list,
+    #         completions,
+    #         num_items_in_batch,
+    #         sampling_per_token_logps_list,
+    #         extra_fields,
+    #     ) = self._generate(prompts)
+
+    #     # Pad prompt and completion tensors
+    #     prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+    #     prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+    #     prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     prompt_mask = pad(prompt_mask, padding_value=0, padding_side="right")
+
+    #     completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+    #     completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+    #     completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+    #     # Mask truncated completions
+    #     if self.mask_truncated_completions:
+    #         eos_and_pad = [self.eos_token_id, self.pad_token_id]
+    #         is_truncated = torch.tensor(
+    #             [ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device
+    #         )
+    #         completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+    #     # Build decoder_input_ids for log-prob computation
+    #     decoder_input_ids = self._build_decoder_input_ids(completion_ids)
+    #     decoder_attention_mask = completion_mask.clone()
+    #     # The start token position should always be attended to
+    #     decoder_attention_mask = torch.cat([
+    #         torch.ones(decoder_attention_mask.size(0), 1, device=device, dtype=torch.long),
+    #         decoder_attention_mask[:, :-1],
+    #     ], dim=1)
+
+    #     logits_to_keep = completion_ids.size(1)
+    #     batch_size = (
+    #         self.args.per_device_train_batch_size if mode == "train"
+    #         else self.args.per_device_eval_batch_size
+    #     )
+
+    #     # Compute old log-probs (for importance sampling)
+    #     with torch.no_grad(), disable_gradient_checkpointing(
+    #         self.model, self.args.gradient_checkpointing_kwargs
+    #     ):
+    #         generate_every = self.args.steps_per_generation * self.num_iterations
+    #         if self.args.gradient_accumulation_steps % generate_every != 0:
+    #             old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                 self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                 batch_size=batch_size,
+    #                 decoder_input_ids=decoder_input_ids,
+    #                 decoder_attention_mask=decoder_attention_mask,
+    #                 completion_ids_for_logps=completion_ids,
+    #             )
+    #         else:
+    #             old_per_token_logps = None
+
+    #         # Reference model log-probs for KL penalty
+    #         if self.beta != 0.0:
+    #             if self.ref_model is not None:
+    #                 ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                     self.ref_model, prompt_ids, prompt_mask, logits_to_keep,
+    #                     batch_size=batch_size,
+    #                     decoder_input_ids=decoder_input_ids,
+    #                     decoder_attention_mask=decoder_attention_mask,
+    #                     completion_ids_for_logps=completion_ids,
+    #                 )
+    #             else:
+    #                 with self.accelerator.unwrap_model(self.model).disable_adapter():
+    #                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                         self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                         batch_size=batch_size,
+    #                         decoder_input_ids=decoder_input_ids,
+    #                         decoder_attention_mask=decoder_attention_mask,
+    #                         completion_ids_for_logps=completion_ids,
+    #                     )
+    #         else:
+    #             ref_per_token_logps = None
+
+    #     # Decode for reward computation
+    #     prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+    #     completions_text = self.processing_class.batch_decode(
+    #         completion_ids, skip_special_tokens=True
+    #     )
+
+    #     # Calculate rewards
+    #     rewards_per_func = self._calculate_rewards(
+    #         inputs, prompts, completions, completion_ids_list
+    #     )
+    #     # print(f"Rewards per function: {rewards_per_func}")
+    #     if self.token_level_rewards:
+    #         # token-level reward: (batch_size, num_reward_funcs, max_len)
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=1) # (batch_size, max_len)
+    #         # Compute advantages (group-normalized)
+    #         num_generations = (
+    #             self.num_generations if mode == "train" else self.num_generations_eval
+    #         )
+            
+    #         mean_grouped_rewards = rewards.view(-1, num_generations, rewards.shape[-1]).mean(dim=1) # (num_groups, max_len)
+    #         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, max_len)
+    #         advantages = rewards - mean_grouped_rewards # (batch_size, max_len)
+
+    #         if self.scale_rewards in ["group", "none"]:
+    #             std_rewards = rewards.view(-1, num_generations, rewards.shape[-1]).std(dim=1) # (num_groups, max_len)
+    #             std_rewards = std_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, max_len)
+    #         elif self.scale_rewards == "batch":
+    #             std_rewards = rewards.std().expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)   # reward_std很小  e 从1e-4改成0.1
+
+    #         # Slice to local process
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+    #         #####新加的这个切片是为了适配 T5 的生成长度（24 或 28 或 31），而不是之前全局的 112。
+    #         # 必须把长度从全局的 112 切回本地的 24 (或 28, 31)
+    #         advantages = advantages[:, :completion_ids.size(1)]
+
+            
+    #         #############################################################################
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, :, i]).sum().item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+    #         return output
+        
+    #     else:
+    #         # sample-level reward
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1) # (batch_size, 1)
+
+    #         # Compute advantages (group-normalized)
+    #         num_generations = (
+    #             self.num_generations if mode == "train" else self.num_generations_eval
+    #         )
+    #         mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1) # (num_groups, 1)
+    #         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, 1)
+    #         advantages = rewards - mean_grouped_rewards
+
+    #         if self.scale_rewards in ["group", "none"]:
+    #             std_rewards = rewards.view(-1, num_generations).std(dim=1)
+    #             std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+    #         elif self.scale_rewards == "batch":
+    #             std_rewards = rewards.std().expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)  #1e-4
+
+    #         # Slice to local process
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, i]).item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+    #         return output
+
+# ##改成处理padding的版本
+    # def _generate_and_score_completions(self, inputs):
+    #     """
+    #     Override to handle encoder-decoder generation and scoring.
+
+    #     Key differences from the parent:
+    #     - T5 generate() returns only decoder output, not [prompt + completion]
+    #     - We store prompt_ids and completion_ids separately (not concatenated)
+    #     - Log-prob computation passes them to encoder and decoder respectively
+    #     """
+    #     device = self.accelerator.device
+    #     mode = "train" if self.model.training else "eval"
+
+    #     prompts = [x["prompt"] for x in inputs]
+
+    #     # Generate completions
+    #     (
+    #         prompt_ids_list,
+    #         completion_ids_list,
+    #         tool_mask_list,
+    #         completions,
+    #         num_items_in_batch,
+    #         sampling_per_token_logps_list,
+    #         extra_fields,
+    #     ) = self._generate(prompts)
+
+    #     # Pad prompt and completion tensors
+    #     prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+    #     prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+    #     prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     prompt_mask = pad(prompt_mask, padding_value=0, padding_side="right")
+
+    #     completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+    #     completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+    #     completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+    #     # Mask truncated completions
+    #     if self.mask_truncated_completions:
+    #         eos_and_pad = [self.eos_token_id, self.pad_token_id]
+    #         is_truncated = torch.tensor(
+    #             [ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device
+    #         )
+    #         completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+    #     # Build decoder_input_ids for log-prob computation
+    #     decoder_input_ids = self._build_decoder_input_ids(completion_ids)
+    #     decoder_attention_mask = completion_mask.clone()
+    #     # The start token position should always be attended to
+    #     decoder_attention_mask = torch.cat([
+    #         torch.ones(decoder_attention_mask.size(0), 1, device=device, dtype=torch.long),
+    #         decoder_attention_mask[:, :-1],
+    #     ], dim=1)
+
+    #     logits_to_keep = completion_ids.size(1)
+    #     batch_size = (
+    #         self.args.per_device_train_batch_size if mode == "train"
+    #         else self.args.per_device_eval_batch_size
+    #     )
+
+    #     # Compute old log-probs (for importance sampling)
+    #     with torch.no_grad(), disable_gradient_checkpointing(
+    #         self.model, self.args.gradient_checkpointing_kwargs
+    #     ):
+    #         generate_every = self.args.steps_per_generation * self.num_iterations
+    #         if self.args.gradient_accumulation_steps % generate_every != 0:
+    #             old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                 self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                 batch_size=batch_size,
+    #                 decoder_input_ids=decoder_input_ids,
+    #                 decoder_attention_mask=decoder_attention_mask,
+    #                 completion_ids_for_logps=completion_ids,
+    #             )
+    #         else:
+    #             old_per_token_logps = None
+
+    #         # Reference model log-probs for KL penalty
+    #         if self.beta != 0.0:
+    #             if self.ref_model is not None:
+    #                 ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                     self.ref_model, prompt_ids, prompt_mask, logits_to_keep,
+    #                     batch_size=batch_size,
+    #                     decoder_input_ids=decoder_input_ids,
+    #                     decoder_attention_mask=decoder_attention_mask,
+    #                     completion_ids_for_logps=completion_ids,
+    #                 )
+    #             else:
+    #                 with self.accelerator.unwrap_model(self.model).disable_adapter():
+    #                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                         self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                         batch_size=batch_size,
+    #                         decoder_input_ids=decoder_input_ids,
+    #                         decoder_attention_mask=decoder_attention_mask,
+    #                         completion_ids_for_logps=completion_ids,
+    #                     )
+    #         else:
+    #             ref_per_token_logps = None
+
+    #     # Decode for reward computation
+    #     prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+    #     completions_text = self.processing_class.batch_decode(
+    #         completion_ids, skip_special_tokens=True
+    #     )
+
+
+
+
+
+
+
+    #     # --- 统一对齐到 hard_max_len ---
+    #     hard_max_len = self.max_completion_length
+    #     device = self.accelerator.device
+
+    #     # 将本地 mask 填充/截断到 hard_max_len
+    #     # completion_mask 原本 shape: (local_batch, local_seq_len)
+    #     curr_seq_len = completion_mask.size(1)
+    #     if curr_seq_len < hard_max_len:
+    #         padding = torch.zeros((completion_mask.size(0), hard_max_len - curr_seq_len), 
+    #                             dtype=completion_mask.dtype, device=device)
+    #         fixed_mask = torch.cat([completion_mask, padding], dim=1)
+    #     else:
+    #         fixed_mask = completion_mask[:, :hard_max_len]
+
+    #     # 现在所有卡的 fixed_mask shape 都是 (local_batch, hard_max_len)
+    #     # 进行全局汇总
+    #     from accelerate.utils import gather as accel_gather
+    #     global_mask = accel_gather(fixed_mask).float() 
+
+    #     # 获取汇总后的奖励
+    #     rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+    #     # 确保维度对齐 (total_batch, num_funcs, hard_max_len)
+    #     # 2. 关键：将 completion_mask 也进行 gather，保证维度对齐
+    #     # 原本的 completion_mask 是本地的，我们需要全局的 mask 来对应全局的 rewards
+
+    #     if self.token_level_rewards:
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).view(1, -1, 1)).nansum(dim=1)
+            
+    #         # 此时两者在 dimension 1 都是 hard_max_len，不会再报错
+    #         rewards = rewards * global_mask
+
+    #         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+            
+    #         # 3. 计算有掩码的 Group Mean
+    #         # 我们需要计算每个 Group 在每个 position 上的平均值，但只考虑有效 token
+    #         # 统计每个位置有效的生成数量
+    #         group_sums = rewards.view(-1, num_generations, rewards.shape[-1]).sum(dim=1)
+    #         group_counts = global_mask.view(-1, num_generations, global_mask.shape[-1]).sum(dim=1).clamp(min=1.0)
+            
+    #         mean_grouped_rewards = (group_sums / group_counts).repeat_interleave(num_generations, dim=0)
+            
+    #         # 4. 计算优势
+    #         advantages = (rewards - mean_grouped_rewards) * global_mask
+
+    #         # 5. 计算有掩码的 Group Std
+    #         if self.scale_rewards in ["group", "none"]:
+    #             # 计算方差: E[X^2] - (E[X])^2，只针对有效 token
+    #             rewards_sq = (rewards**2) * global_mask
+    #             group_sums_sq = rewards_sq.view(-1, num_generations, rewards_sq.shape[-1]).sum(dim=1)
+    #             mean_sq = group_sums_sq / group_counts
+                
+    #             var_rewards = (mean_sq - (group_sums / group_counts)**2).clamp(min=0.0)
+    #             std_rewards = torch.sqrt(var_rewards + 1e-4).repeat_interleave(num_generations, dim=0)
+                
+    #         elif self.scale_rewards == "batch":
+    #             # 全局 Batch 维度的标准差（也需考虑 Mask）
+    #             active_elements = rewards[global_mask > 0]
+    #             std_val = active_elements.std() if active_elements.numel() > 1 else torch.tensor(1.0, device=device)
+    #             std_rewards = std_val.expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         # 6. 标准化优势并应用最终 Mask
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)
+            
+    #         advantages = advantages * global_mask  # 再次确保 padding 处绝对为 0
+
+    #         # --- 以下是原有的切片和指标记录逻辑 ---
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+    #         # 适配 T5 实际长度
+    #         advantages = advantages[:, :completion_ids.size(1)]
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         #############################################################################
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, :, i]).sum().item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+    #         return output
+        
+    #     else:
+    #         # sample-level reward
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1) # (batch_size, 1)
+
+    #         # Compute advantages (group-normalized)
+    #         num_generations = (
+    #             self.num_generations if mode == "train" else self.num_generations_eval
+    #         )
+    #         mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1) # (num_groups, 1)
+    #         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, 1)
+    #         advantages = rewards - mean_grouped_rewards
+
+    #         if self.scale_rewards in ["group", "none"]:
+    #             std_rewards = rewards.view(-1, num_generations).std(dim=1)
+    #             std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+    #         elif self.scale_rewards == "batch":
+    #             std_rewards = rewards.std().expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)  #1e-4
+
+    #         # Slice to local process
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, i]).item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+    #         return output
+
+# ## std计算改正
+    # def _generate_and_score_completions(self, inputs):
+    #     """
+    #     Override to handle encoder-decoder generation and scoring.
+
+    #     Key differences from the parent:
+    #     - T5 generate() returns only decoder output, not [prompt + completion]
+    #     - We store prompt_ids and completion_ids separately (not concatenated)
+    #     - Log-prob computation passes them to encoder and decoder respectively
+    #     """
+    #     device = self.accelerator.device
+    #     mode = "train" if self.model.training else "eval"
+
+    #     prompts = [x["prompt"] for x in inputs]
+
+    #     # Generate completions
+    #     (
+    #         prompt_ids_list,
+    #         completion_ids_list,
+    #         tool_mask_list,
+    #         completions,
+    #         num_items_in_batch,
+    #         sampling_per_token_logps_list,
+    #         extra_fields,
+    #     ) = self._generate(prompts)
+
+    #     # Pad prompt and completion tensors
+    #     prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+    #     prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+    #     prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     prompt_mask = pad(prompt_mask, padding_value=0, padding_side="right")
+
+    #     completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+    #     completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+    #     completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+    #     completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+    #     # Mask truncated completions
+    #     if self.mask_truncated_completions:
+    #         eos_and_pad = [self.eos_token_id, self.pad_token_id]
+    #         is_truncated = torch.tensor(
+    #             [ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device
+    #         )
+    #         completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+
+    #     # Build decoder_input_ids for log-prob computation
+    #     decoder_input_ids = self._build_decoder_input_ids(completion_ids)
+    #     decoder_attention_mask = completion_mask.clone()
+    #     # The start token position should always be attended to
+    #     decoder_attention_mask = torch.cat([
+    #         torch.ones(decoder_attention_mask.size(0), 1, device=device, dtype=torch.long),
+    #         decoder_attention_mask[:, :-1],
+    #     ], dim=1)
+
+    #     logits_to_keep = completion_ids.size(1)
+    #     batch_size = (
+    #         self.args.per_device_train_batch_size if mode == "train"
+    #         else self.args.per_device_eval_batch_size
+    #     )
+
+    #     # Compute old log-probs (for importance sampling)
+    #     with torch.no_grad(), disable_gradient_checkpointing(
+    #         self.model, self.args.gradient_checkpointing_kwargs
+    #     ):
+    #         generate_every = self.args.steps_per_generation * self.num_iterations
+    #         if self.args.gradient_accumulation_steps % generate_every != 0:
+    #             old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                 self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                 batch_size=batch_size,
+    #                 decoder_input_ids=decoder_input_ids,
+    #                 decoder_attention_mask=decoder_attention_mask,
+    #                 completion_ids_for_logps=completion_ids,
+    #             )
+    #         else:
+    #             old_per_token_logps = None
+
+    #         # Reference model log-probs for KL penalty
+    #         if self.beta != 0.0:
+    #             if self.ref_model is not None:
+    #                 ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                     self.ref_model, prompt_ids, prompt_mask, logits_to_keep,
+    #                     batch_size=batch_size,
+    #                     decoder_input_ids=decoder_input_ids,
+    #                     decoder_attention_mask=decoder_attention_mask,
+    #                     completion_ids_for_logps=completion_ids,
+    #                 )
+    #             else:
+    #                 with self.accelerator.unwrap_model(self.model).disable_adapter():
+    #                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+    #                         self.model, prompt_ids, prompt_mask, logits_to_keep,
+    #                         batch_size=batch_size,
+    #                         decoder_input_ids=decoder_input_ids,
+    #                         decoder_attention_mask=decoder_attention_mask,
+    #                         completion_ids_for_logps=completion_ids,
+    #                     )
+    #         else:
+    #             ref_per_token_logps = None
+
+    #     # Decode for reward computation
+    #     prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
+    #     completions_text = self.processing_class.batch_decode(
+    #         completion_ids, skip_special_tokens=True
+    #     )
+
+
+
+    #     # --- 统一对齐到 hard_max_len ---
+    #     hard_max_len = self.max_completion_length
+    #     device = self.accelerator.device
+
+    #     # 将本地 mask 填充/截断到 hard_max_len
+    #     # completion_mask 原本 shape: (local_batch, local_seq_len)
+    #     curr_seq_len = completion_mask.size(1)
+    #     if curr_seq_len < hard_max_len:
+    #         padding = torch.zeros((completion_mask.size(0), hard_max_len - curr_seq_len), 
+    #                             dtype=completion_mask.dtype, device=device)
+    #         fixed_mask = torch.cat([completion_mask, padding], dim=1)
+    #     else:
+    #         fixed_mask = completion_mask[:, :hard_max_len]
+
+    #     # 现在所有卡的 fixed_mask shape 都是 (local_batch, hard_max_len)
+    #     # 进行全局汇总
+    #     from accelerate.utils import gather as accel_gather
+    #     global_mask = accel_gather(fixed_mask).float() 
+
+    #     # 获取汇总后的奖励
+    #     rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+    #     # 确保维度对齐 (total_batch, num_funcs, hard_max_len)
+    #     # 2. 关键：将 completion_mask 也进行 gather，保证维度对齐
+    #     # 原本的 completion_mask 是本地的，我们需要全局的 mask 来对应全局的 rewards
+
+    #     if self.token_level_rewards:
+    #        # 1. 基础奖励计算 (batch_size, global_max_len)
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).view(1, -1, 1)).nansum(dim=1)
+            
+    #         # 【关键修复 1】: 强制将 Padding 位置的 reward 设为 0 (防止干扰均值计算)
+    #         # 这里的 global_mask 必须是 gather 后的全量 mask
+    #         rewards = rewards * global_mask 
+
+    #         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+            
+    #         # 【关键修复 2】: 计算有掩码的均值 (Masked Mean)
+    #         # 不能直接用 .mean()，因为 padding 的 0 会拉低均值，导致有效 token 的 advantage 全变成正的
+    #         group_sums = rewards.view(-1, num_generations, rewards.shape[-1]).sum(dim=1)
+    #         # 统计每个位置在当前组内有多少个非 padding 的有效 token
+    #         group_counts = global_mask.view(-1, num_generations, global_mask.shape[-1]).sum(dim=1).clamp(min=1.0)
+            
+    #         # 计算真正的有效均值
+    #         mean_grouped_rewards = (group_sums / group_counts).repeat_interleave(num_generations, dim=0)
+            
+    #         # 2. 计算原始优势值
+    #         advantages = (rewards - mean_grouped_rewards) * global_mask
+
+    #         # 【关键修复 3】: 计算有掩码的标准差 (Masked Std)
+    #         if self.scale_rewards in ["group", "none"]:
+    #             # 使用方差公式: E[X^2] - (E[X])^2，只针对有效 token
+    #             rewards_sq = (rewards**2) * global_mask
+    #             group_sums_sq = rewards_sq.view(-1, num_generations, rewards_sq.shape[-1]).sum(dim=1)
+    #             mean_sq = group_sums_sq / group_counts
+                
+    #             var_rewards = (mean_sq - (group_sums / group_counts)**2).clamp(min=0.0)
+    #             std_rewards = torch.sqrt(var_rewards + 1e-4).repeat_interleave(num_generations, dim=0)
+    #         elif self.scale_rewards == "batch":
+    #             # batch 模式下也要只统计有效部分
+    #             active_elements = rewards[global_mask > 0]
+    #             std_val = active_elements.std() if active_elements.numel() > 1 else torch.tensor(1.0, device=device)
+    #             std_rewards = std_val.expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         # 3. 标准化并应用最终掩码
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)
+            
+    #         # 【关键修复 4】: 确保优势值在 padding 处绝对为 0
+    #         advantages = advantages * global_mask
+
+    #         # 5. 计算有掩码的 Group Std
+    #         if self.scale_rewards in ["group", "none"]:
+    #             # 计算方差: E[X^2] - (E[X])^2，只针对有效 token
+    #             rewards_sq = (rewards**2) * global_mask
+    #             group_sums_sq = rewards_sq.view(-1, num_generations, rewards_sq.shape[-1]).sum(dim=1)
+    #             mean_sq = group_sums_sq / group_counts
+                
+    #             var_rewards = (mean_sq - (group_sums / group_counts)**2).clamp(min=0.0)
+    #             std_rewards = torch.sqrt(var_rewards + 1e-4).repeat_interleave(num_generations, dim=0)
+                
+    #         elif self.scale_rewards == "batch":
+    #             # 全局 Batch 维度的标准差（也需考虑 Mask）
+    #             active_elements = rewards[global_mask > 0]
+    #             std_val = active_elements.std() if active_elements.numel() > 1 else torch.tensor(1.0, device=device)
+    #             std_rewards = std_val.expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         # 6. 标准化优势并应用最终 Mask
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)
+            
+    #         advantages = advantages * global_mask  # 再次确保 padding 处绝对为 0
+
+    #         # --- 以下是原有的切片和指标记录逻辑 ---
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+    #         # 适配 T5 实际长度
+    #         advantages = advantages[:, :completion_ids.size(1)]
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         #############################################################################
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, :, i]).sum().item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+            
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+
+
+
+
+    #         print("adv mean:", advantages.abs().mean().item())
+    #         print("adv max:", advantages.abs().max().item())
+    #         print("adv nonzero:", (advantages!=0).float().mean().item())
+    #         return output
+        
+    #     else:
+    #         # sample-level reward
+    #         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1) # (batch_size, 1)
+
+    #         # Compute advantages (group-normalized)
+    #         num_generations = (
+    #             self.num_generations if mode == "train" else self.num_generations_eval
+    #         )
+    #         mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1) # (num_groups, 1)
+    #         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, 1)
+    #         advantages = rewards - mean_grouped_rewards
+
+    #         if self.scale_rewards in ["group", "none"]:
+    #             std_rewards = rewards.view(-1, num_generations).std(dim=1)
+    #             std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
+    #         elif self.scale_rewards == "batch":
+    #             std_rewards = rewards.std().expand_as(rewards)
+    #         else:
+    #             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+
+    #         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
+    #         if self.scale_rewards != "none":
+    #             advantages = advantages / (std_rewards + 1e-4)  #1e-4
+
+    #         # Slice to local process
+    #         process_slice = slice(
+    #             self.accelerator.process_index * len(prompts),
+    #             (self.accelerator.process_index + 1) * len(prompts),
+    #         )
+    #         all_process_advantages = advantages.clone()
+    #         advantages = advantages[process_slice]
+
+    #         # Log metrics
+    #         for i, reward_func_name in enumerate(self.reward_func_names):
+    #             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
+    #                 torch.nanmean(rewards_per_func[:, i]).item()
+    #             )
+    #         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
+    #         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+    #         self._metrics[mode]["frac_reward_zero_std"].append(
+    #             is_std_zero.float().mean().item()
+    #         )
+
+    #         self._logs["prompt"].extend(gather_object(prompts_text))
+    #         self._logs["completion"].extend(gather_object(completions_text))
+    #         for i, name in enumerate(self.reward_func_names):
+    #             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+    #         self._logs["advantages"].extend(all_process_advantages.tolist())
+
+    #         output = {
+    #             "prompt_ids": prompt_ids,
+    #             "prompt_mask": prompt_mask,
+    #             "completion_ids": completion_ids,
+    #             "completion_mask": completion_mask,
+    #             "decoder_input_ids": decoder_input_ids,
+    #             "decoder_attention_mask": decoder_attention_mask,
+    #             "advantages": advantages,
+    #             "num_items_in_batch": num_items_in_batch,
+    #         }
+    #         if old_per_token_logps is not None:
+    #             output["old_per_token_logps"] = old_per_token_logps
+    #         if ref_per_token_logps is not None:
+    #             output["ref_per_token_logps"] = ref_per_token_logps
+    #         return output
+
+    
     def _generate_and_score_completions(self, inputs):
         """
-        Override to handle encoder-decoder generation and scoring.
+        Seq2Seq version with token-level advantages.
 
-        Key differences from the parent:
-        - T5 generate() returns only decoder output, not [prompt + completion]
-        - We store prompt_ids and completion_ids separately (not concatenated)
-        - Log-prob computation passes them to encoder and decoder respectively
+        目标：
+        1. reward 是 token-level
+        2. group mean / std 的计算完全忽略 padding
+        3. 多卡 gather 后再做 group normalization
+        4. 最后切回当前进程的本地 batch
         """
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
-
         prompts = [x["prompt"] for x in inputs]
 
-        # Generate completions
+        # ------------------------------------------------------------
+        # 1. 生成
+        # ------------------------------------------------------------
         (
             prompt_ids_list,
             completion_ids_list,
@@ -157,61 +1010,100 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             extra_fields,
         ) = self._generate(prompts)
 
-        # Pad prompt and completion tensors
-        prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+        # ------------------------------------------------------------
+        # 2. 构造 prompt / completion tensor
+        # ------------------------------------------------------------
+        prompt_ids = [torch.tensor(ids, device=device, dtype=torch.long) for ids in prompt_ids_list]
         prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
-        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
-        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="right")
+        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="right")
 
-        completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+        completion_ids = [torch.tensor(ids, device=device, dtype=torch.long) for ids in completion_ids_list]
         completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
         completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
         completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
 
-        # Mask truncated completions
+        # 如果需要，把被截断的 completion 全部 mask 掉
         if self.mask_truncated_completions:
             eos_and_pad = [self.eos_token_id, self.pad_token_id]
             is_truncated = torch.tensor(
-                [ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device
+                [ids[-1] not in eos_and_pad for ids in completion_ids_list],
+                device=device,
+                dtype=torch.bool,
             )
-            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).long()
 
-        # Build decoder_input_ids for log-prob computation
+        local_bsz = completion_ids.size(0)
+        local_seq_len = completion_ids.size(1)
+
+        # ------------------------------------------------------------
+        # 3. 为多卡 gather 对齐长度：统一到 hard_max_len
+        # ------------------------------------------------------------
+        hard_max_len = self.max_completion_length
+
+        def pad_or_truncate(x, target_len, pad_value):
+            curr_len = x.size(1)
+            if curr_len < target_len:
+                pad_tensor = torch.full(
+                    (x.size(0), target_len - curr_len),
+                    pad_value,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                return torch.cat([x, pad_tensor], dim=1)
+            else:
+                return x[:, :target_len]
+
+        fixed_completion_ids = pad_or_truncate(completion_ids, hard_max_len, self.pad_token_id)
+        fixed_completion_mask = pad_or_truncate(completion_mask, hard_max_len, 0)
+
+        # ------------------------------------------------------------
+        # 4. 构造 decoder_input_ids / decoder_attention_mask
+        #    注意：logprob 仍然只对本地真实长度 logits_to_keep 计算
+        # ------------------------------------------------------------
         decoder_input_ids = self._build_decoder_input_ids(completion_ids)
-        decoder_attention_mask = completion_mask.clone()
-        # The start token position should always be attended to
-        decoder_attention_mask = torch.cat([
-            torch.ones(decoder_attention_mask.size(0), 1, device=device, dtype=torch.long),
-            decoder_attention_mask[:, :-1],
-        ], dim=1)
+        decoder_attention_mask = torch.cat(
+            [
+                torch.ones((local_bsz, 1), dtype=torch.long, device=device),
+                completion_mask[:, :-1],
+            ],
+            dim=1,
+        )
 
         logits_to_keep = completion_ids.size(1)
         batch_size = (
-            self.args.per_device_train_batch_size if mode == "train"
+            self.args.per_device_train_batch_size
+            if mode == "train"
             else self.args.per_device_eval_batch_size
         )
 
-        # Compute old log-probs (for importance sampling)
+# ------------------------------------------------------------
+# 5. 计算 old logprobs / ref logprobs
+#    最小修复：
+#    始终显式计算 rollout 对应的 old_per_token_logps，
+#    不再依赖 generate_every / grad_accum 的条件分支。
+# ------------------------------------------------------------
         with torch.no_grad(), disable_gradient_checkpointing(
             self.model, self.args.gradient_checkpointing_kwargs
         ):
-            generate_every = self.args.steps_per_generation * self.num_iterations
-            if self.args.gradient_accumulation_steps % generate_every != 0:
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model, prompt_ids, prompt_mask, logits_to_keep,
-                    batch_size=batch_size,
-                    decoder_input_ids=decoder_input_ids,
-                    decoder_attention_mask=decoder_attention_mask,
-                    completion_ids_for_logps=completion_ids,
-                )
-            else:
-                old_per_token_logps = None
+            old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                self.model,
+                prompt_ids,
+                prompt_mask,
+                logits_to_keep,
+                batch_size=batch_size,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                completion_ids_for_logps=completion_ids,
+            )
 
-            # Reference model log-probs for KL penalty
             if self.beta != 0.0:
                 if self.ref_model is not None:
                     ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model, prompt_ids, prompt_mask, logits_to_keep,
+                        self.ref_model,
+                        prompt_ids,
+                        prompt_mask,
+                        logits_to_keep,
                         batch_size=batch_size,
                         decoder_input_ids=decoder_input_ids,
                         decoder_attention_mask=decoder_attention_mask,
@@ -220,7 +1112,10 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
                         ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model, prompt_ids, prompt_mask, logits_to_keep,
+                            self.model,
+                            prompt_ids,
+                            prompt_mask,
+                            logits_to_keep,
                             batch_size=batch_size,
                             decoder_input_ids=decoder_input_ids,
                             decoder_attention_mask=decoder_attention_mask,
@@ -229,148 +1124,151 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             else:
                 ref_per_token_logps = None
 
-        # Decode for reward computation
+        # ------------------------------------------------------------
+        # 6. decode 文本（主要用于日志）
+        # ------------------------------------------------------------
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        completions_text = self.processing_class.batch_decode(
-            completion_ids, skip_special_tokens=True
-        )
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
-        # Calculate rewards
-        rewards_per_func = self._calculate_rewards(
-            inputs, prompts, completions, completion_ids_list
-        )
-        # print(f"Rewards per function: {rewards_per_func}")
-        if self.token_level_rewards:
-            # token-level reward: (batch_size, num_reward_funcs, max_len)
-            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=1) # (batch_size, max_len)
-            # Compute advantages (group-normalized)
-            num_generations = (
-                self.num_generations if mode == "train" else self.num_generations_eval
+        # ------------------------------------------------------------
+        # 7. 计算 token-level rewards
+        #    约定：返回 shape = (global_batch, num_reward_funcs, hard_max_len)
+        # ------------------------------------------------------------
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+
+        if not self.token_level_rewards:
+            raise ValueError("This implementation is for token-level rewards only.")
+
+        # ------------------------------------------------------------
+        # 8. gather 本地 mask，得到 global mask
+        # ------------------------------------------------------------
+        from accelerate.utils import gather as accel_gather
+
+        global_mask = accel_gather(fixed_completion_mask).float()   # (global_batch, hard_max_len)
+
+        # 合并多 reward function
+        # rewards: (global_batch, hard_max_len)
+        reward_weights = self.reward_weights.to(device).view(1, -1, 1)
+        rewards = (rewards_per_func * reward_weights).nansum(dim=1)
+
+        # padding 位置强制清零，后面均值/方差只看 mask
+        rewards = rewards * global_mask
+
+        # ------------------------------------------------------------
+        # 9. group-wise token advantage，忽略 padding
+        # ------------------------------------------------------------
+        num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+
+        global_batch_size = rewards.size(0)
+        if global_batch_size % num_generations != 0:
+            raise ValueError(
+                f"Global batch size ({global_batch_size}) is not divisible by "
+                f"num_generations ({num_generations})."
             )
-            mean_grouped_rewards = rewards.view(-1, num_generations, rewards.shape[-1]).mean(dim=1) # (num_groups, max_len)
-            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, max_len)
-            advantages = rewards - mean_grouped_rewards # (batch_size, max_len)
 
-            if self.scale_rewards in ["group", "none"]:
-                std_rewards = rewards.view(-1, num_generations, rewards.shape[-1]).std(dim=1) # (num_groups, max_len)
-                std_rewards = std_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, max_len)
-            elif self.scale_rewards == "batch":
-                std_rewards = rewards.std().expand_as(rewards)
+        num_groups = global_batch_size // num_generations
+
+        grouped_rewards = rewards.view(num_groups, num_generations, hard_max_len)
+        grouped_mask = global_mask.view(num_groups, num_generations, hard_max_len)
+
+        # 每个 group、每个 token 位置，有多少有效样本
+        valid_counts = grouped_mask.sum(dim=1)  # (num_groups, hard_max_len)
+
+        # masked mean
+        reward_sums = grouped_rewards.sum(dim=1)  # (num_groups, hard_max_len)
+        mean_grouped_rewards = reward_sums / valid_counts.clamp(min=1.0)
+
+        # 先广播回 global shape
+        mean_expanded = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+
+        # 原始 advantage
+        advantages = (rewards - mean_expanded) * global_mask
+
+        # ------------------------------------------------------------
+        # 10. masked std，忽略 padding
+        # ------------------------------------------------------------
+        if self.scale_rewards in ["group", "none"]:
+            centered = (grouped_rewards - mean_grouped_rewards.unsqueeze(1)) * grouped_mask
+            var_grouped = (centered ** 2).sum(dim=1) / valid_counts.clamp(min=1.0)
+            std_grouped = torch.sqrt(var_grouped + 1e-8)
+            std_expanded = std_grouped.repeat_interleave(num_generations, dim=0)
+
+        elif self.scale_rewards == "batch":
+            active_rewards = rewards[global_mask > 0]
+            if active_rewards.numel() > 1:
+                batch_std = active_rewards.std(unbiased=False)
             else:
-                raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+                batch_std = torch.tensor(1.0, device=device)
+            std_expanded = batch_std.expand_as(rewards)
 
-            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-            if self.scale_rewards != "none":
-                advantages = advantages / (std_rewards + 1e-4)   # reward_std很小  e 从1e-4改成0.1
-
-            # Slice to local process
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            all_process_advantages = advantages.clone()
-            advantages = advantages[process_slice]
-            #####新加的这个切片是为了适配 T5 的生成长度（24 或 28 或 31），而不是之前全局的 112。
-            # 必须把长度从全局的 112 切回本地的 24 (或 28, 31)
-            advantages = advantages[:, :completion_ids.size(1)]
-            #############################################################################
-            # Log metrics
-            for i, reward_func_name in enumerate(self.reward_func_names):
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
-                    torch.nanmean(rewards_per_func[:, :, i]).sum().item()
-                )
-            self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-            self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-            self._metrics[mode]["frac_reward_zero_std"].append(
-                is_std_zero.float().mean().item()
-            )
-
-            self._logs["prompt"].extend(gather_object(prompts_text))
-            self._logs["completion"].extend(gather_object(completions_text))
-            for i, name in enumerate(self.reward_func_names):
-                self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-            self._logs["advantages"].extend(all_process_advantages.tolist())
-
-            output = {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "decoder_input_ids": decoder_input_ids,
-                "decoder_attention_mask": decoder_attention_mask,
-                "advantages": advantages,
-                "num_items_in_batch": num_items_in_batch,
-            }
-            if old_per_token_logps is not None:
-                output["old_per_token_logps"] = old_per_token_logps
-            if ref_per_token_logps is not None:
-                output["ref_per_token_logps"] = ref_per_token_logps
-            return output
-        
         else:
-            # sample-level reward
-            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1) # (batch_size, 1)
+            raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
 
-            # Compute advantages (group-normalized)
-            num_generations = (
-                self.num_generations if mode == "train" else self.num_generations_eval
-            )
-            mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1) # (num_groups, 1)
-            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0) # (batch_size, 1)
-            advantages = rewards - mean_grouped_rewards
+        is_std_zero = torch.isclose(std_expanded, torch.zeros_like(std_expanded))
 
-            if self.scale_rewards in ["group", "none"]:
-                std_rewards = rewards.view(-1, num_generations).std(dim=1)
-                std_rewards = std_rewards.repeat_interleave(num_generations, dim=0)
-            elif self.scale_rewards == "batch":
-                std_rewards = rewards.std().expand_as(rewards)
-            else:
-                raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
+        if self.scale_rewards != "none":
+            advantages = advantages / (std_expanded + 1e-8)
 
-            is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
-            if self.scale_rewards != "none":
-                advantages = advantages / (std_rewards + 1e-4)  #1e-4
+        # 再次确保 padding 位置严格为 0
+        advantages = advantages * global_mask
 
-            # Slice to local process
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            all_process_advantages = advantages.clone()
-            advantages = advantages[process_slice]
+        # ------------------------------------------------------------
+        # 11. 切回当前进程本地 batch
+        # ------------------------------------------------------------
+        process_slice = slice(
+            self.accelerator.process_index * local_bsz,
+            (self.accelerator.process_index + 1) * local_bsz,
+        )
+        local_advantages = advantages[process_slice, :local_seq_len]
 
-            # Log metrics
-            for i, reward_func_name in enumerate(self.reward_func_names):
-                self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(
-                    torch.nanmean(rewards_per_func[:, i]).item()
-                )
-            self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-            self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
-            self._metrics[mode]["frac_reward_zero_std"].append(
-                is_std_zero.float().mean().item()
-            )
+        # ------------------------------------------------------------
+        # 12. 日志
+        # ------------------------------------------------------------
+        for i, reward_func_name in enumerate(self.reward_func_names):
+            # rewards_per_func: (global_batch, num_reward_funcs, hard_max_len)
+            func_rewards = rewards_per_func[:, i, :]
+            func_masked_mean = (func_rewards * global_mask).sum() / global_mask.sum().clamp(min=1.0)
+            self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(func_masked_mean.item())
 
-            self._logs["prompt"].extend(gather_object(prompts_text))
-            self._logs["completion"].extend(gather_object(completions_text))
-            for i, name in enumerate(self.reward_func_names):
-                self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-            self._logs["advantages"].extend(all_process_advantages.tolist())
+        masked_reward_mean = rewards.sum() / global_mask.sum().clamp(min=1.0)
+        self._metrics[mode]["reward"].append(masked_reward_mean.item())
 
-            output = {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "decoder_input_ids": decoder_input_ids,
-                "decoder_attention_mask": decoder_attention_mask,
-                "advantages": advantages,
-                "num_items_in_batch": num_items_in_batch,
-            }
-            if old_per_token_logps is not None:
-                output["old_per_token_logps"] = old_per_token_logps
-            if ref_per_token_logps is not None:
-                output["ref_per_token_logps"] = ref_per_token_logps
-            return output
+        masked_std_mean = (std_expanded * global_mask).sum() / global_mask.sum().clamp(min=1.0)
+        self._metrics[mode]["reward_std"].append(masked_std_mean.item())
+
+        self._metrics[mode]["frac_reward_zero_std"].append(
+            is_std_zero.float().mean().item()
+        )
+
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
+        for i, name in enumerate(self.reward_func_names):
+            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+        self._logs["advantages"].extend(advantages.tolist())
+
+        # ------------------------------------------------------------
+        # 13. 返回
+        # ------------------------------------------------------------
+        output = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "decoder_input_ids": decoder_input_ids,
+            "decoder_attention_mask": decoder_attention_mask,
+            "advantages": local_advantages,
+            "num_items_in_batch": num_items_in_batch,
+        }
+
+        if old_per_token_logps is not None:
+            output["old_per_token_logps"] = old_per_token_logps
+        if ref_per_token_logps is not None:
+            output["ref_per_token_logps"] = ref_per_token_logps
+
+        return output
+
+
+
 
     def _compute_loss(self, model, inputs):
         """
@@ -471,6 +1369,16 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
                 self.accelerator.gather(clip_ratio).mean().item()
             )
 
+
+
+
+        if self.accelerator.is_main_process and self.state.global_step < 10:
+            print("advantages abs mean:", advantages.abs().mean().item())
+            print("advantages abs max:", advantages.abs().max().item())
+            print("log_ratio abs mean:", log_ratio.abs().mean().item())
+            print("log_ratio abs max:", log_ratio.abs().max().item())
+            print("coef_1 mean:", coef_1.mean().item())
+            print("coef_1 max:", coef_1.max().item())
         return loss
     
     def _generate_single_turn(self, prompts):
@@ -522,7 +1430,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
                 num_beams=num_generations,
                 num_return_sequences=num_generations,
                 # prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
-                do_sample=False,
+                # do_sample=False,
                 eos_token_id=self.eos_token_id,
                 pad_token_id=self.pad_token_id,
                 decoder_start_token_id=unwrapped_model.config.decoder_start_token_id,
@@ -530,8 +1438,10 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
             # Input: (unique_prompt_num, seq_len)
             # Output: (unique_prompt_num * num_generations, dec_len)
             generated_ids = unwrapped_model.generate(
+                do_sample=False,
                 **generate_inputs,
                 generation_config=beam_gen_config,
+                # prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
             )
 
         # --- Step 3: Strip decoder_start_token_id ---
@@ -765,10 +1675,58 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         else:
             return super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
 
+    # def _calculate_rewards_token_level(self, inputs, prompts, completions, completion_ids_list):
+    #     device = self.accelerator.device
+    #     local_max_len = max(len(ids) for ids in completion_ids_list)
+    #     global_max_len = max(gather_object([local_max_len])) # get global max_len across all processes
+
+    #     rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), global_max_len, device=device) # (batch_size, num_reward_funcs, max_len)
+
+    #     # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
+    #     keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+    #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+
+    #     # This allows for dynamic reward shaping based on training progress.
+    #     reward_kwargs["trainer_state"] = self.state
+
+    #     for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
+    #         zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names, strict=True)
+    #     ):
+    #         with profiling_context(self, reward_func_name):
+    #             output_reward_func = reward_func(
+    #                 prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+    #             ) # (batch_size, current_sample_completion_len)
+
+    #             for j, rewards in enumerate(output_reward_func):
+    #                 # Convert None values to NaN
+    #                 rewards = [r if r is not None else torch.nan for r in rewards]
+    #                 rewards_per_func[j, i, :len(rewards)] = torch.tensor(rewards, dtype=torch.float32, device=device)
+
+    #     # If all reward functions return None for a given row, issue a detailed warning
+    #     if torch.isnan(rewards_per_func).all(dim=1).any():
+    #         nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+    #         row_reward_kwargs = {
+    #             key: value[nan_row_idx] for key, value in reward_kwargs.items() if key != "trainer_state"
+    #         }
+    #         row_reward_kwargs["prompt"] = prompts[nan_row_idx]
+    #         row_reward_kwargs["completion"] = completions[nan_row_idx]
+    #         logger.warning(
+    #             f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
+    #             "Please ensure that at least one reward function returns a valid reward."
+    #         )
+
+    #     # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+    #     # completions may be distributed across processes
+    #     # print(f"{device}: rewards_per_func before gather: {rewards_per_func.shape}")
+    #     rewards_per_func = gather(rewards_per_func) # (total_batch_size, num_reward_funcs, max_len)
+    #     return rewards_per_func
+
+
+
     def _calculate_rewards_token_level(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
-        local_max_len = max(len(ids) for ids in completion_ids_list)
-        global_max_len = max(gather_object([local_max_len])) # get global max_len across all processes
+        hard_max_len = self.max_completion_length
+        global_max_len = hard_max_len  # get global max_len across all processes
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), global_max_len, device=device) # (batch_size, num_reward_funcs, max_len)
 
@@ -808,46 +1766,8 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         # print(f"{device}: rewards_per_func before gather: {rewards_per_func.shape}")
-        rewards_per_func = gather(rewards_per_func) # (total_batch_size, num_reward_funcs, max_len)
-        return rewards_per_func
+        # 使用 TRL 提供的 gather (这个函数更适合 GRPO 的维度汇总)
+        from accelerate.utils import gather as accel_gather
+        return accel_gather(rewards_per_func)
 
         
-    # def _calculate_rewards_token_level(self, inputs, prompts, completions, completion_ids_list):
-    #     device = self.accelerator.device
-        
-    #     # 1. 确定当前 batch 中 completion 的最大长度
-    #     max_len = max(len(ids) for ids in completion_ids_list) if completion_ids_list else 0
-        
-    #     # 2. 初始化奖励张量 (注意：这是本地进程的 size)
-    #     # shape: (batch_size_per_device, max_completion_len, num_reward_funcs)
-    #     rewards_per_func = torch.zeros(len(prompts), max_len, len(self.reward_funcs), device=device)
-
-    #     # 准备奖励函数的参数
-    #     keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-    #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-    #     reward_kwargs["trainer_state"] = self.state
-
-    #     # 3. 循环调用奖励函数
-    #     for i, (reward_func, _, reward_func_name) in enumerate(
-    #         zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
-    #     ):
-    #         with profiling_context(self, reward_func_name):
-    #             # 调用你的奖励函数，它应该返回一个 List[List[float]]
-    #             # 外层长度 = len(prompts)，内层长度 = 各个 completion 的长度
-    #             output_reward_func = reward_func(
-    #                 prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
-    #             )
-
-    #             # 4. 将奖励填入张量
-    #             for j, rewards in enumerate(output_reward_func):
-    #                 # 如果奖励是 None，转为 NaN
-    #                 rewards = [r if r is not None else torch.nan for r in rewards]
-    #                 # 填入对应的 token 位置
-    #                 rel_len = min(len(rewards), max_len)
-    #                 rewards_per_func[j, :rel_len, i] = torch.tensor(
-    #                     rewards[:rel_len], dtype=torch.float32, device=device
-    #                 )
-
-    #     # 5. 【关键】直接返回本地计算的结果，绝对不要调用 gather(rewards_per_func)
-    #     # TRL 基类会自动处理后续的跨进程均值/标准差计算
-    #     return rewards_per_func
