@@ -1441,7 +1441,7 @@ class Seq2SeqGRPOTrainer(GRPOTrainer):
                 do_sample=False,
                 **generate_inputs,
                 generation_config=beam_gen_config,
-                # prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
+                prefix_allowed_tokens_fn=self.prefix_allowed_tokens_fn,
             )
 
         # --- Step 3: Strip decoder_start_token_id ---

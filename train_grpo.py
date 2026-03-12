@@ -192,13 +192,13 @@ def main():
 
     # --- CustomGRPOTrainer 实例化 ---
     trainer = Seq2SeqGRPOTrainer(
-        # prefix_allowed_tokens_fn = prefix_allowed_tokens_fn,
+        prefix_allowed_tokens_fn = prefix_allowed_tokens_fn,
         # ref_model=ref_model,
         token_level_rewards=True,
         beam_search=True,
         model=model,
         args=grpo_config,
-        reward_funcs=[reward_scorer.reward_function_pulsed],
+        reward_funcs=[reward_scorer.reward_function_decay_state_all_without_GLOBAL_VALID_REWARD],
         train_dataset=train_dataset, 
         eval_dataset=dev_dataset,
         processing_class=tokenizer,

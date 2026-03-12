@@ -1,49 +1,51 @@
+
+"""
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 accelerate launch --num_processes=6 \
+/data2/chenran/workspace/ly/workspace/grpodebug/msmarco-tu-new-t5-grpo/train_datasets_split/datasets_split.py
+"""
 import os
 import gzip
 import torch
 import sys
-import math
 from tqdm import tqdm
+from accelerate import Accelerator
 from transformers import PreTrainedModel, PreTrainedTokenizer, T5ForConditionalGeneration, T5Tokenizer
+# try:
+#     import debugpy
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 9503))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     print(f"Debugpy failed to start: {e}")
 
 # ==========================================
-# 1. 环境与路径配置 (解决 ModuleNotFoundError)
+# 1. 环境与路径配置
 # ==========================================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 确保从父目录导入 utils 里的工具函数
 from utils import build_partial_trie, load_encoded_docids_and_create_map, docid2string_msmarco, safe_lookup, load_qrels
 
-# ==========================================
-# 2. 模型加载与词表对齐工具
-# ==========================================
-def align_tokenizer_vocab_with_model(tokenizer: PreTrainedTokenizer, model: PreTrainedModel):
+def align_tokenizer_vocab_with_model(tokenizer, model):
     target_vocab_size = model.config.vocab_size
     current_tokenizer_size = len(tokenizer)
-    
     if current_tokenizer_size < target_vocab_size:
         num_to_add = target_vocab_size - current_tokenizer_size
-        print(f"📊 词表不匹配检测: 模型({target_vocab_size}) > Tokenizer({current_tokenizer_size})")
-        print(f"正在添加 {num_to_add} 个占位符 Token...")
         new_tokens = [f"<extra_token_{i}>" for i in range(num_to_add)]
         tokenizer.add_tokens(new_tokens)
-        # 注意：如果是 SFT 后的模型，通常词表已经扩充过，这里是为了防止意外
     return tokenizer
 
 def load_generative_retrieval_model(path):
-    # 使用 use_fast=True 提高处理速度
     tokenizer = T5Tokenizer.from_pretrained(path, use_fast=True)
-    base_model = T5ForConditionalGeneration.from_pretrained(
-        path,
-        torch_dtype=torch.float32,
-        device_map=None, # 由脚本手动控制 device
-        low_cpu_mem_usage=False
+    model = T5ForConditionalGeneration.from_pretrained(
+        path, torch_dtype=torch.float32, device_map=None, low_cpu_mem_usage=False
     )
-    tokenizer = align_tokenizer_vocab_with_model(tokenizer, base_model)
-    return base_model, tokenizer
+    tokenizer = align_tokenizer_vocab_with_model(tokenizer, model)
+    return model, tokenizer
+
 
 # ==========================================
 # 3. 筛选配置
@@ -56,113 +58,131 @@ OUTPUT_FILTERED_QUERIES = "/data2/chenran/workspace/ly/workspace/grpodebug/msmar
 # 训练集 Qrels 用于判定 GT 排名
 TRAIN_QRELS_PATH = "/data2/chenran/workspace/ly/workspace/modelscope/msmarco-tu-datasets/msmarco-doctrain-qrels.tsv.gz"
 
+
+# 临时文件夹用于存放断点数据
+TEMP_DIR = "/data2/chenran/workspace/ly/workspace/grpodebug/msmarco-tu-new-t5-grpo/train_datasets_split/temp_splits"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 TOP_K_THRESHOLD = 15
-BATCH_SIZE = 64  # 根据显存 24G-80G 灵活调整
+BATCH_SIZE = 128  
 
 # ==========================================
-# 4. 核心逻辑：获取并保存 Top-15 命中的数据集
+# 3. 核心逻辑
 # ==========================================
 def get_filtered_dataset():
-    # 强制指定设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. 加载模型并移动到 GPU
-    print(f"Loading model from {CHECKPOINT_PATH}...")
-    model, tokenizer = load_generative_retrieval_model(CHECKPOINT_PATH)
-    model.to(device)
-    model.eval()
+    accelerator = Accelerator()
+    device = accelerator.device
 
-    # 2. 加载 DocID 映射表和构建 Trie
-    print("Loading DocID maps and building Trie...")
+    # 1. 加载模型与 Trie
+    if accelerator.is_main_process:
+        print(f"Loading model on {accelerator.num_processes} GPUs...")
+    
+    model, tokenizer = load_generative_retrieval_model(CHECKPOINT_PATH)
     encoded_key_to_original, _, all_encoded = load_encoded_docids_and_create_map(ENCODED_DOCID_PATH)
     
-    # 构建 Trie 用于 prefix_allowed_tokens_fn
     trie_sequences = [[tokenizer.pad_token_id] + item for item in all_encoded]
     docid_trie = build_partial_trie(trie_sequences)
 
-    # 定义约束函数
     def prefix_allowed_tokens_fn(batch_id, sent):
-        # 将 sent (tensor) 转为 list，确保 Trie 查询兼容性
-        outputs = docid_trie.get(sent.tolist())
-        return outputs if len(outputs) > 0 else [tokenizer.eos_token_id]
+        return docid_trie.get(sent.tolist()) or [tokenizer.eos_token_id]
 
-    # 3. 读取数据：训练查询和 Qrels
+    # 2. 准备数据与断点恢复逻辑
     queries = []
     with gzip.open(ORIGINAL_TRAIN_QUERIES, "rt", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split("\t")
-            if len(parts) == 2:
-                queries.append(parts)
-
-    print(f"Loading Qrels from {TRAIN_QRELS_PATH}...")
+            if len(parts) == 2: queries.append(parts)
+    
     train_qrels = load_qrels(TRAIN_QRELS_PATH)
 
-    # 4. 推理与筛选
-    filtered_count = 0
-    print(f"Starting filtering... Target: Top-{TOP_K_THRESHOLD} Hits")
-    
-    # 
-    
-    with gzip.open(OUTPUT_FILTERED_QUERIES, "wt", encoding="utf-8") as out_f:
-        # 分 batch 进行推理以提高速度
-        for i in tqdm(range(0, len(queries), BATCH_SIZE)):
-            batch_data = queries[i : i + BATCH_SIZE]
-            batch_qids = [x[0] for x in batch_data]
-            batch_texts = [x[1] for x in batch_data]
+    # 每个进程维护自己的临时保存文件
+    rank = accelerator.process_index
+    temp_file_path = os.path.join(TEMP_DIR, f"rank_{rank}_hits.tsv")
+    processed_qids_path = os.path.join(TEMP_DIR, f"rank_{rank}_processed.log")
 
-            # 编码输入并确保在 GPU 上
-            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to(device)
+    # 加载已经处理过的 qid 列表 (断点续传)
+    processed_qids = set()
+    if os.path.exists(processed_qids_path):
+        with open(processed_qids_path, "r") as f:
+            processed_qids = set(line.strip() for line in f)
+
+    # 将数据切分到不同的 GPU 进程
+    with accelerator.split_between_processes(queries) as process_queries:
+        # 过滤掉本进程已经处理过的查询
+        remaining_queries = [q for q in process_queries if q[0] not in processed_qids]
+        
+        # 以追加模式打开文件
+        with open(temp_file_path, "a") as hit_f, open(processed_qids_path, "a") as proc_f:
             
-            with torch.no_grad():
-                # 修复核心：显式指定 input_ids, attention_mask 和 decoder 相关的 ID
-                outputs = model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_length=100,
-                    num_beams=TOP_K_THRESHOLD,
-                    num_return_sequences=TOP_K_THRESHOLD,
-                    prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    decoder_start_token_id=model.config.decoder_start_token_id
-                )
-
-            # 遍历 Batch 结果
-            for j, qid in enumerate(batch_qids):
-                gt_set = train_qrels.get(qid, set())
-                if not gt_set:
-                    continue
-
-                # 从生成的 outputs 中切分出当前 sample 的所有 beams (TOP_K 个)
-                start_idx = j * TOP_K_THRESHOLD
-                end_idx = (j + 1) * TOP_K_THRESHOLD
-                sample_beams = outputs[start_idx:end_idx]
-
-                found_hit = False
-                for beam_ids in sample_beams:
-                    # 1. ID 序列转 key 字符串
-                    pred_key = docid2string_msmarco(beam_ids.tolist())
-                    # 2. Key 转 DocID (带 fallback 逻辑适配你的数据库)
-                    pred_docids = safe_lookup(
-                        pred_key, 
-                        encoded_key_to_original, 
-                        fallback=True, 
-                        alt_key=pred_key + ",1"
-                    )
-                    
-                    # 3. 命中判定
-                    if any(d in gt_set for d in pred_docids):
-                        found_hit = True
-                        break
+            # 3. 推理循环
+            for i in tqdm(range(0, len(remaining_queries), BATCH_SIZE), 
+                          disable=not accelerator.is_local_main_process,
+                          desc=f"GPU {rank} Processing"):
                 
-                # 如果前 15 名里有任意一个命中了真实文档，保留该 Query
-                if found_hit:
-                    out_f.write(f"{qid}\t{batch_texts[j]}\n")
-                    filtered_count += 1
+                batch_data = remaining_queries[i : i + BATCH_SIZE]
+                batch_qids = [x[0] for x in batch_data]
+                batch_texts = [x[1] for x in batch_data]
 
-    print(f"✅ 筛选完成！原始样本: {len(queries)}, 保留样本: {filtered_count}")
-    print(f"输出文件: {OUTPUT_FILTERED_QUERIES}")
+                inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to(device)
+                
+                with torch.no_grad():
+                    outputs = model.to(device).generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        max_length=100,
+                        num_beams=TOP_K_THRESHOLD,
+                        num_return_sequences=TOP_K_THRESHOLD,
+                        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        decoder_start_token_id=model.config.decoder_start_token_id
+                    )
+
+                # 处理结果
+                for j, qid in enumerate(batch_qids):
+                    gt_set = train_qrels.get(qid, set())
+                    if not gt_set: 
+                        proc_f.write(f"{qid}\n") # 即使没GT也算处理过
+                        continue
+
+                    start_idx = j * TOP_K_THRESHOLD
+                    sample_beams = outputs[start_idx : (j + 1) * TOP_K_THRESHOLD]
+
+                    found_hit = False
+                    for beam_ids in sample_beams:
+                        pred_key = docid2string_msmarco(beam_ids.tolist())
+                        pred_docids = safe_lookup(pred_key, encoded_key_to_original, fallback=True, alt_key=pred_key + ",1")
+                        if any(d in gt_set for d in pred_docids):
+                            found_hit = True
+                            break
+                    
+                    if found_hit:
+                        hit_f.write(f"{qid}\t{batch_texts[j]}\n")
+                        hit_f.flush() # 实时刷入磁盘
+                    
+                    proc_f.write(f"{qid}\n")
+                    proc_f.flush()
+
+    # 4. 等待所有进程结束，由主进程汇总
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        print("Merging all temporary results...")
+        final_results = set()
+        for r in range(accelerator.num_processes):
+            t_file = os.path.join(TEMP_DIR, f"rank_{r}_hits.tsv")
+            if os.path.exists(t_file):
+                with open(t_file, "r") as f:
+                    for line in f:
+                        final_results.add(line.strip())
+
+        with gzip.open(OUTPUT_FILTERED_QUERIES, "wt", encoding="utf-8") as out_f:
+            for item in sorted(list(final_results)):
+                out_f.write(item + "\n")
+        
+        print(f"✅ All Done. Final count: {len(final_results)}")
+        print(f"File saved at: {OUTPUT_FILTERED_QUERIES}")
 
 if __name__ == "__main__":
     get_filtered_dataset()
